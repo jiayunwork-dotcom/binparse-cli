@@ -11,6 +11,7 @@ pub mod filter;
 pub mod stats;
 pub mod patch;
 pub mod bfmt;
+pub mod template;
 
 pub use dsl::*;
 pub use parser::*;
@@ -24,3 +25,4 @@ pub use filter::*;
 pub use stats::*;
 pub use patch::*;
 pub use bfmt::*;
+pub use template::*;

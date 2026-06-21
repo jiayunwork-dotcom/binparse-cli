@@ -86,7 +86,7 @@ impl<'de> Deserialize<'de> for DataType {
 }
 
 impl DataType {
-    fn from_yaml_value(value: &serde_yaml::Value) -> Result<Self, String> {
+    pub fn from_yaml_value(value: &serde_yaml::Value) -> Result<Self, String> {
         match value {
             serde_yaml::Value::String(s) => match s.as_str() {
                 "u8" => Ok(DataType::U8),

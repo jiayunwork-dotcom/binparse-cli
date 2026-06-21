@@ -149,6 +149,9 @@ pub enum Commands {
 
         #[arg(long, help = "优化字符串表，按引用频次降序排列")]
         optimize: bool,
+
+        #[arg(long, help = "实例化配置文件路径 (.bfmt-instance.yaml)，指定后先实例化再编译")]
+        instance: Option<PathBuf>,
     },
     #[command(about = "反编译.bfmt二进制文件为YAML格式定义")]
     Decompile {
@@ -165,6 +168,24 @@ pub enum Commands {
 
         #[arg(help = "第二个格式定义文件路径 (.yaml/.bfmt)")]
         file2: PathBuf,
+    },
+    #[command(about = "实例化模板定义文件，输出标准格式定义YAML")]
+    Instantiate {
+        #[arg(help = "实例化配置文件路径 (.bfmt-instance.yaml)")]
+        config: PathBuf,
+
+        #[arg(short, long, help = "输出文件路径，默认输出到stdout")]
+        output: Option<PathBuf>,
+    },
+    #[command(about = "验证模板定义文件的语法正确性")]
+    ValidateTemplate {
+        #[arg(help = "模板定义文件路径 (.bfmt-template.yaml)")]
+        template: PathBuf,
+    },
+    #[command(about = "列出模板定义文件中的所有参数信息")]
+    ListParams {
+        #[arg(help = "模板定义文件路径 (.bfmt-template.yaml)")]
+        template: PathBuf,
     },
 }
 

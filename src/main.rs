@@ -48,14 +48,23 @@ fn run(cli: Cli) -> Result<i32, Box<dyn std::error::Error>> {
         }) => {
             return run_patch_cmd(input, output, format.as_deref(), builtin_format.as_deref(), sets, patch_file.as_deref(), vars, *dry_run, *undo);
         }
-        Some(Commands::Compile { input, output, debug, target_version, cache, optimize }) => {
-            return Ok(run_compile(input, output, *debug, target_version.unwrap_or(0), *cache, *optimize)? as i32);
+        Some(Commands::Compile { input, output, debug, target_version, cache, optimize, instance }) => {
+            return Ok(run_compile(input, output, *debug, target_version.unwrap_or(0), *cache, *optimize, instance.as_deref())? as i32);
         }
         Some(Commands::Decompile { input, output }) => {
             return Ok(run_decompile(input, output.as_deref())? as i32);
         }
         Some(Commands::DiffFormat { file1, file2 }) => {
             return run_diff_format(file1, file2);
+        }
+        Some(Commands::Instantiate { config, output }) => {
+            return Ok(run_instantiate(config, output.as_deref())? as i32);
+        }
+        Some(Commands::ValidateTemplate { template }) => {
+            return Ok(run_validate_template(template)? as i32);
+        }
+        Some(Commands::ListParams { template }) => {
+            return Ok(run_list_params(template)? as i32);
         }
         _ => {}
     }
@@ -276,6 +285,132 @@ fn run_diff(
     Ok(ExitCode::Success)
 }
 
+fn run_instantiate(
+    config_path: &Path,
+    output_path: Option<&Path>,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let config = match InstanceConfig::from_file(config_path) {
+        Ok(c) => c,
+        Err(TemplateError::YamlError(e)) => {
+            eprintln!("实例化配置文件解析错误: {}", e);
+            return Ok(ExitCode::FormatError);
+        }
+        Err(TemplateError::IoError(e)) => {
+            eprintln!("读取实例化配置文件失败: {}", e);
+            return Ok(ExitCode::FormatError);
+        }
+        Err(e) => {
+            eprintln!("实例化配置文件错误: {}", e);
+            return Ok(ExitCode::FormatError);
+        }
+    };
+
+    let template_path = Path::new(&config.template_path);
+    let template = match TemplateDefinition::from_file(template_path) {
+        Ok(t) => t,
+        Err(TemplateError::YamlError(e)) => {
+            eprintln!("模板定义文件解析错误: {}", e);
+            return Ok(ExitCode::FormatError);
+        }
+        Err(TemplateError::IoError(e)) => {
+            eprintln!("读取模板定义文件失败: {}", e);
+            return Ok(ExitCode::FormatError);
+        }
+        Err(e) => {
+            eprintln!("模板定义文件错误: {}", e);
+            return Ok(ExitCode::FormatError);
+        }
+    };
+
+    let format_def = match template.instantiate(&config.parameters) {
+        Ok(d) => d,
+        Err(TemplateError::ParameterTypeError { name, expected, value }) => {
+            eprintln!("参数类型错误: 参数 '{}' 期望类型为 {}, 实际值为 '{}'", name, expected, value);
+            return Ok(ExitCode::FormatError);
+        }
+        Err(TemplateError::MissingParameter(name)) => {
+            eprintln!("缺少必填参数: '{}'", name);
+            return Ok(ExitCode::FormatError);
+        }
+        Err(e) => {
+            eprintln!("模板实例化失败: {}", e);
+            return Ok(ExitCode::FormatError);
+        }
+    };
+
+    let yaml_output = serde_yaml::to_string(&format_def)?;
+
+    if let Some(path) = output_path {
+        fs::write(path, &yaml_output)?;
+        println!("实例化结果已写入: {}", path.display());
+    } else {
+        print!("{}", yaml_output);
+    }
+
+    Ok(ExitCode::Success)
+}
+
+fn run_validate_template(
+    template_path: &Path,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let template = match TemplateDefinition::from_file(template_path) {
+        Ok(t) => t,
+        Err(TemplateError::YamlError(e)) => {
+            eprintln!("模板定义文件解析错误: {}", e);
+            return Ok(ExitCode::FormatError);
+        }
+        Err(TemplateError::IoError(e)) => {
+            eprintln!("读取模板定义文件失败: {}", e);
+            return Ok(ExitCode::FormatError);
+        }
+        Err(e) => {
+            eprintln!("模板定义文件错误: {}", e);
+            return Ok(ExitCode::FormatError);
+        }
+    };
+
+    let errors = template.validate_template();
+
+    if errors.is_empty() {
+        println!("模板定义有效");
+        Ok(ExitCode::Success)
+    } else {
+        for err in &errors {
+            eprintln!("错误 [{}]: {}", err.location, err.reason);
+        }
+        Ok(ExitCode::FormatError)
+    }
+}
+
+fn run_list_params(
+    template_path: &Path,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let template = match TemplateDefinition::from_file(template_path) {
+        Ok(t) => t,
+        Err(TemplateError::YamlError(e)) => {
+            eprintln!("模板定义文件解析错误: {}", e);
+            return Ok(ExitCode::FormatError);
+        }
+        Err(TemplateError::IoError(e)) => {
+            eprintln!("读取模板定义文件失败: {}", e);
+            return Ok(ExitCode::FormatError);
+        }
+        Err(e) => {
+            eprintln!("模板定义文件错误: {}", e);
+            return Ok(ExitCode::FormatError);
+        }
+    };
+
+    let params = template.get_parameters();
+    if params.is_empty() {
+        println!("该模板没有声明任何参数");
+    } else {
+        print!("{}", format_params_table(params));
+    }
+
+    Ok(ExitCode::Success)
+}
+
 fn run_validate(format_path: &Path) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let def = if let Some(ext) = format_path.extension().and_then(|e| e.to_str()) {
         if ext == "bfmt" {
@@ -346,6 +481,10 @@ fn load_format_def(
     data: &[u8],
 ) -> Result<FormatDefinition, Box<dyn std::error::Error>> {
     if let Some(fp) = format_path {
+        let file_name = fp.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if file_name.contains(".bfmt-template.") {
+            return Err("指定的文件是模板定义文件(.bfmt-template.yaml)，请先使用instantiate子命令实例化后再使用".into());
+        }
         if let Some(ext) = fp.extension().and_then(|e| e.to_str()) {
             if ext == "bfmt" {
                 let mut file = fs::File::open(fp)?;
@@ -375,6 +514,7 @@ fn run_compile(
     target_version: u16,
     use_cache: bool,
     optimize: bool,
+    instance: Option<&Path>,
 ) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let yaml_content = match fs::read_to_string(input) {
         Ok(y) => y,
@@ -384,9 +524,31 @@ fn run_compile(
         }
     };
 
+    let def = if let Some(instance_path) = instance {
+        let instance_config = InstanceConfig::from_file(instance_path)
+            .map_err(|e| format!("读取实例化配置失败: {}", e))?;
+        let template_path = Path::new(&instance_config.template_path);
+        let template = TemplateDefinition::from_file(template_path)
+            .map_err(|e| format!("读取模板定义失败: {}", e))?;
+        let def = template.instantiate(&instance_config.parameters)
+            .map_err(|e| format!("模板实例化失败: {}", e))?;
+        let yaml_result = serde_yaml::to_string(&def)
+            .map_err(|e| format!("序列化实例化结果失败: {}", e))?;
+        FormatDefinition::from_yaml(&yaml_result)
+            .map_err(|e| format!("实例化后的格式定义验证失败: {}", e))?
+    } else {
+        match FormatDefinition::from_yaml(&yaml_content) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("YAML解析错误: {}", e);
+                return Ok(ExitCode::FormatError);
+            }
+        }
+    };
+
     let source_sha256 = compute_sha256(&yaml_content.as_bytes());
 
-    if use_cache {
+    if use_cache && instance.is_none() {
         let meta_path = get_meta_path(output);
         if meta_path.exists() {
             if let Ok(meta) = read_meta(&meta_path) {
@@ -399,17 +561,10 @@ fn run_compile(
         }
     }
 
-    let def = match FormatDefinition::from_yaml(&yaml_content) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("YAML解析错误: {}", e);
-            return Ok(ExitCode::FormatError);
-        }
-    };
     let mut file = fs::File::create(output)?;
     let size = compile_to_bfmt(&def, &mut file, include_debug, target_version, optimize)?;
 
-    if use_cache {
+    if use_cache && instance.is_none() {
         let meta_path = get_meta_path(output);
         let meta = BfmtMeta {
             source_path: input.to_string_lossy().to_string(),
@@ -435,6 +590,9 @@ fn run_compile(
     println!("  字段: {} 个", field_count);
     if optimize {
         println!("  字符串表: 已优化");
+    }
+    if instance.is_some() {
+        println!("  实例化: 是");
     }
     Ok(ExitCode::Success)
 }
