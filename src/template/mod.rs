@@ -802,6 +802,19 @@ root:
         let result = template.instantiate(&params).unwrap();
         assert_eq!(result.name, "DeviceFirmware");
         assert_eq!(result.root.fields.len(), 6);
+        
+        // 验证 bytes 类型的 length 参数替换
+        let header_data_field = &result.root.fields[1];
+        assert_eq!(header_data_field.name, "header_data");
+        match &header_data_field.data_type {
+            DataType::Bytes { length } => {
+                assert_eq!(length, "16"); // 默认值 16
+            }
+            _ => panic!("Expected Bytes type"),
+        }
+        
+        // 验证 offset 字段的参数替换
+        // offset 是 "relative"，不包含占位符
     }
 
     #[test]
@@ -905,6 +918,56 @@ root:
         params.insert("header_size".to_string(), serde_yaml::Value::String("not_a_number".into()));
         let result = template.instantiate(&params);
         assert!(matches!(result, Err(TemplateError::ParameterTypeError { .. })));
+    }
+
+    #[test]
+    fn test_substitute_yaml_value_nested() {
+        let mut params = HashMap::new();
+        params.insert("header_size".to_string(), serde_yaml::Value::Number(32.into()));
+
+        let yaml = serde_yaml::Value::Mapping({
+            let mut outer = serde_yaml::Mapping::new();
+            let mut inner = serde_yaml::Mapping::new();
+            inner.insert(
+                serde_yaml::Value::String("length".to_string()),
+                serde_yaml::Value::String("${header_size}".to_string()),
+            );
+            outer.insert(
+                serde_yaml::Value::String("bytes".to_string()),
+                serde_yaml::Value::Mapping(inner),
+            );
+            outer
+        });
+
+        let result = substitute_yaml_value(&yaml, &params);
+
+        match &result {
+            serde_yaml::Value::Mapping(outer_map) => {
+                let bytes_val = outer_map.get(&serde_yaml::Value::String("bytes".to_string())).unwrap();
+                match bytes_val {
+                    serde_yaml::Value::Mapping(inner_map) => {
+                        let length_val = inner_map.get(&serde_yaml::Value::String("length".to_string())).unwrap();
+                        match length_val {
+                            serde_yaml::Value::String(s) => {
+                                assert_eq!(s, "32");
+                            }
+                            _ => panic!("length should be a string"),
+                        }
+                    }
+                    _ => panic!("bytes value should be a mapping"),
+                }
+            }
+            _ => panic!("result should be a mapping"),
+        }
+
+        // 同时验证 DataType::from_yaml_value 能正确解析
+        let data_type = DataType::from_yaml_value(&result).unwrap();
+        match data_type {
+            DataType::Bytes { length } => {
+                assert_eq!(length, "32");
+            }
+            _ => panic!("Expected Bytes type"),
+        }
     }
 
     #[test]
