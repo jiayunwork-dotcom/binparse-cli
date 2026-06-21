@@ -313,7 +313,9 @@ fn collect_strings_from_data_type(dt: &DataType, table: &mut StringTable) {
 fn collect_strings_from_field(field: &Field, table: &mut StringTable) {
     table.insert(&field.name);
     if let Some(offset) = &field.offset {
-        table.insert(offset);
+        if offset != "relative" {
+            table.insert(offset);
+        }
     }
     collect_strings_from_data_type(&field.data_type, table);
     if let Some(cond) = &field.condition {
@@ -444,12 +446,10 @@ fn encode_field<W: Write>(
     *offset += 1;
     writer.write_all(&[display_format_to_code(field.display_format)])?;
     *offset += 1;
-    let offset_idx = field
-        .offset
-        .as_ref()
-        .and_then(|o| table.index_map.get(o))
-        .copied()
-        .unwrap_or(INVALID_INDEX);
+    let offset_idx = match field.offset.as_deref() {
+        Some("relative") | None => INVALID_INDEX,
+        Some(o) => table.index_map.get(o).copied().unwrap_or(INVALID_INDEX),
+    };
     writer.write_all(&offset_idx.to_le_bytes())?;
     *offset += 4;
     let cond_idx = field
@@ -710,7 +710,7 @@ fn decode_field<R: Read>(
     read_exact(reader, &mut offset_idx_buf, offset)?;
     let offset_idx = u32::from_le_bytes(offset_idx_buf);
     let field_offset = if offset_idx == INVALID_INDEX {
-        None
+        Some("relative".to_string())
     } else {
         Some(table.get(offset_idx, *offset - 4)?.to_string())
     };
@@ -1016,5 +1016,30 @@ root:
         assert!(size_debug > size_normal);
         let field_count = count_fields(&def);
         assert_eq!(size_debug - size_normal, field_count * 4);
+    }
+
+    #[test]
+    fn test_relative_offset_encodes_as_invalid_index() {
+        let def = create_test_format();
+        let mut buf = Vec::new();
+        compile_to_bfmt(&def, &mut buf, false).unwrap();
+        let relative_fields: Vec<_> = def.root.fields.iter()
+            .filter(|f| f.offset.as_deref() == Some("relative"))
+            .collect();
+        assert!(!relative_fields.is_empty(), "test format should have relative offset fields");
+        let def2 = load_from_bfmt(&mut buf.as_slice()).unwrap();
+        for orig in &relative_fields {
+            let restored = def2.root.fields.iter().find(|f| f.name == orig.name).unwrap();
+            assert_eq!(restored.offset.as_deref(), Some("relative"),
+                "field '{}' should have offset=relative after roundtrip", orig.name);
+        }
+    }
+
+    #[test]
+    fn test_decompile_produces_relative_offset_in_yaml() {
+        let def = create_test_format();
+        let yaml = decompile_to_yaml(&def).unwrap();
+        assert!(yaml.contains("offset: relative"),
+            "decompiled YAML should contain 'offset: relative', got:\n{}", yaml);
     }
 }
