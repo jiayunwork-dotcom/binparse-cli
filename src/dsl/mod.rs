@@ -52,7 +52,7 @@ impl Default for DisplayFormat {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DataType {
     U8,
     U16,
@@ -181,6 +181,82 @@ impl DataType {
     }
 }
 
+impl Serialize for DataType {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            DataType::U8 => serializer.serialize_str("u8"),
+            DataType::U16 => serializer.serialize_str("u16"),
+            DataType::U32 => serializer.serialize_str("u32"),
+            DataType::U64 => serializer.serialize_str("u64"),
+            DataType::I8 => serializer.serialize_str("i8"),
+            DataType::I16 => serializer.serialize_str("i16"),
+            DataType::I32 => serializer.serialize_str("i32"),
+            DataType::I64 => serializer.serialize_str("i64"),
+            DataType::F32 => serializer.serialize_str("f32"),
+            DataType::F64 => serializer.serialize_str("f64"),
+            DataType::Bytes { length } => {
+                use serde::ser::SerializeMap;
+                let mut map = serializer.serialize_map(Some(1))?;
+                let mut inner = std::collections::HashMap::new();
+                inner.insert("length", length.clone());
+                map.serialize_entry("bytes", &inner)?;
+                map.end()
+            }
+            DataType::String { length, encoding } => {
+                use serde::ser::SerializeMap;
+                let mut map = serializer.serialize_map(Some(1))?;
+                let mut inner = std::collections::HashMap::new();
+                inner.insert("length", length.clone());
+                if let Some(enc) = encoding {
+                    inner.insert("encoding", enc.clone());
+                }
+                map.serialize_entry("string", &inner)?;
+                map.end()
+            }
+            DataType::BitField { bit_start, bit_length } => {
+                use serde::ser::SerializeMap;
+                let mut map = serializer.serialize_map(Some(1))?;
+                let mut inner = std::collections::HashMap::new();
+                inner.insert("bit_start", bit_start.to_string());
+                inner.insert("bit_length", bit_length.to_string());
+                map.serialize_entry("bit_field", &inner)?;
+                map.end()
+            }
+            DataType::Struct { name } => {
+                use serde::ser::SerializeMap;
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("struct", name)?;
+                map.end()
+            }
+            DataType::Array { element_type, length } => {
+                use serde::ser::SerializeMap;
+                let mut map = serializer.serialize_map(Some(1))?;
+                let mut inner = std::collections::HashMap::<String, serde_yaml::Value>::new();
+                inner.insert("length".to_string(), serde_yaml::Value::String(length.clone()));
+                inner.insert("element_type".to_string(), serde_yaml::to_value(element_type).map_err(serde::ser::Error::custom)?);
+                map.serialize_entry("array", &inner)?;
+                map.end()
+            }
+            DataType::Enum { name, underlying } => {
+                use serde::ser::SerializeMap;
+                let mut map = serializer.serialize_map(Some(1))?;
+                let mut inner = std::collections::HashMap::<String, serde_yaml::Value>::new();
+                inner.insert("name".to_string(), serde_yaml::Value::String(name.clone()));
+                let underlying_str = match underlying.as_ref() {
+                    DataType::U8 => "u8",
+                    DataType::U16 => "u16",
+                    DataType::U32 => "u32",
+                    DataType::U64 => "u64",
+                    _ => "u32",
+                };
+                inner.insert("underlying".to_string(), serde_yaml::Value::String(underlying_str.to_string()));
+                map.serialize_entry("enum", &inner)?;
+                map.end()
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Condition {
     #[serde(rename = "when")]
@@ -197,7 +273,7 @@ pub struct ChecksumField {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Field {
     pub name: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offset: Option<String>,
     #[serde(rename = "type")]
     pub data_type: DataType,
@@ -205,11 +281,11 @@ pub struct Field {
     pub endian: Endian,
     #[serde(default, rename = "format")]
     pub display_format: DisplayFormat,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub condition: Option<Condition>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checksum: Option<ChecksumField>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 }
 
@@ -222,7 +298,7 @@ pub struct EnumDefinition {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StructDefinition {
     pub name: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub magic: Option<Vec<u8>>,
     pub fields: Vec<Field>,
 }

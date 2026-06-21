@@ -10,7 +10,7 @@ pub struct Cli {
     #[arg(short, long, help = "二进制文件路径")]
     pub file: Option<PathBuf>,
 
-    #[arg(short = 'F', long, help = "YAML格式定义文件路径")]
+    #[arg(short = 'F', long, help = "格式定义文件路径 (.yaml/.yml/.bfmt)")]
     pub format: Option<PathBuf>,
 
     #[arg(short = 't', long, help = "使用内置格式 (png/bmp/wav/zip/elf/pe)")]
@@ -39,7 +39,7 @@ pub enum Commands {
         #[arg(help = "二进制文件路径")]
         file: PathBuf,
 
-        #[arg(short = 'F', long, help = "YAML格式定义文件路径")]
+        #[arg(short = 'F', long, help = "格式定义文件路径 (.yaml/.yml/.bfmt)")]
         format: Option<PathBuf>,
 
         #[arg(short = 't', long, help = "使用内置格式")]
@@ -71,7 +71,7 @@ pub enum Commands {
         #[arg(help = "第二个文件路径")]
         file2: PathBuf,
 
-        #[arg(short = 'F', long, help = "YAML格式定义文件路径")]
+        #[arg(short = 'F', long, help = "格式定义文件路径 (.yaml/.yml/.bfmt)")]
         format: Option<PathBuf>,
 
         #[arg(short = 't', long, help = "使用内置格式")]
@@ -86,9 +86,9 @@ pub enum Commands {
         #[arg(long, help = "字段路径glob过滤模式")]
         filter: Option<String>,
     },
-    #[command(about = "验证YAML格式定义文件的正确性")]
+    #[command(about = "验证格式定义文件的正确性")]
     Validate {
-        #[arg(help = "YAML格式定义文件路径")]
+        #[arg(help = "格式定义文件路径 (.yaml/.yml/.bfmt)")]
         format: PathBuf,
     },
     #[command(about = "列出内置格式")]
@@ -129,6 +129,25 @@ pub enum Commands {
 
         #[arg(long, help = "撤销最近一次patch操作，从.binpatch_history文件恢复")]
         undo: bool,
+    },
+    #[command(about = "编译YAML格式定义为二进制.bfmt文件")]
+    Compile {
+        #[arg(help = "YAML格式定义文件路径")]
+        input: PathBuf,
+
+        #[arg(help = "输出.bfmt文件路径")]
+        output: PathBuf,
+
+        #[arg(long, help = "包含调试信息（字段在YAML中的行号）")]
+        debug: bool,
+    },
+    #[command(about = "反编译.bfmt二进制文件为YAML格式定义")]
+    Decompile {
+        #[arg(help = ".bfmt文件路径")]
+        input: PathBuf,
+
+        #[arg(short, long, help = "输出文件路径，默认输出到stdout")]
+        output: Option<PathBuf>,
     },
 }
 

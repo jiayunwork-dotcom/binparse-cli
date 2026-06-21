@@ -1,0 +1,54 @@
+name: TestFormat
+magic: [0xDE, 0xAD, 0xBE, 0xEF]
+enums:
+  - name: TestEnum
+    values:
+      VALUE_A: 0
+      VALUE_B: 1
+      VALUE_C: 2
+structs:
+  - name: SubStruct
+    fields:
+      - name: sub_field1
+        type: u16
+        offset: "0"
+        endian: big
+        format: hex
+      - name: sub_field2
+        type: u32
+        offset: relative
+        format: dec
+root:
+  name: RootStruct
+  fields:
+    - name: magic
+      type:
+        bytes:
+          length: "4"
+      offset: "0"
+      format: hex
+    - name: length
+      type: u32
+      offset: relative
+      endian: little
+      format: dec
+    - name: type_code
+      type:
+        enum:
+          name: TestEnum
+          underlying: u8
+      offset: relative
+    - name: data
+      type:
+        struct: SubStruct
+      offset: relative
+      condition:
+        when: type_code == 1
+    - name: checksum
+      type: u32
+      offset: relative
+      format: hex
+      checksum:
+        algorithm: crc32
+        start: "4"
+        end: "12"

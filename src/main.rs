@@ -44,6 +44,12 @@ fn run(cli: Cli) -> Result<i32, Box<dyn std::error::Error>> {
         }) => {
             return run_patch_cmd(input, output, format.as_deref(), builtin_format.as_deref(), sets, patch_file.as_deref(), vars, *dry_run, *undo);
         }
+        Some(Commands::Compile { input, output, debug }) => {
+            return Ok(run_compile(input, output, *debug)? as i32);
+        }
+        Some(Commands::Decompile { input, output }) => {
+            return Ok(run_decompile(input, output.as_deref())? as i32);
+        }
         _ => {}
     }
 
@@ -186,20 +192,7 @@ fn run_diff(
     let data1 = read_data(file1)?;
     let data2 = read_data(file2)?;
 
-    let format_def = if let Some(format_path) = format_path {
-        let yaml = fs::read_to_string(format_path)?;
-        FormatDefinition::from_yaml(&yaml).map_err(|e| format!("格式定义错误: {}", e))?
-    } else if let Some(builtin) = builtin_format {
-        parse_builtin_format(builtin).map_err(|e| format!("内置格式错误: {}", e))?
-    } else {
-        match detect_format(&data1) {
-            Some(def) => def,
-            None => {
-                eprintln!("无法自动检测文件格式，请使用 --format 或 --builtin-format 指定格式定义");
-                return Ok(ExitCode::NoMatch);
-            }
-        }
-    };
+    let format_def = load_format_def(format_path, builtin_format, &data1)?;
 
     let (parsed1, _) = parser::parse(&data1, &format_def)?;
     let (parsed2, _) = parser::parse(&data2, &format_def)?;
@@ -277,14 +270,36 @@ fn run_diff(
 }
 
 fn run_validate(format_path: &Path) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    let yaml = fs::read_to_string(format_path)
-        .map_err(|e| format!("无法读取格式定义文件: {}", e))?;
-
-    let def = match FormatDefinition::from_yaml_unvalidated(&yaml) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("格式定义错误: {}", e);
-            return Ok(ExitCode::FormatError);
+    let def = if let Some(ext) = format_path.extension().and_then(|e| e.to_str()) {
+        if ext == "bfmt" {
+            let mut file = fs::File::open(format_path)?;
+            match load_from_bfmt(&mut file) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("二进制格式定义加载错误: {}", e);
+                    return Ok(ExitCode::FormatError);
+                }
+            }
+        } else {
+            let yaml = fs::read_to_string(format_path)
+                .map_err(|e| format!("无法读取格式定义文件: {}", e))?;
+            match FormatDefinition::from_yaml_unvalidated(&yaml) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("格式定义错误: {}", e);
+                    return Ok(ExitCode::FormatError);
+                }
+            }
+        }
+    } else {
+        let yaml = fs::read_to_string(format_path)
+            .map_err(|e| format!("无法读取格式定义文件: {}", e))?;
+        match FormatDefinition::from_yaml_unvalidated(&yaml) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("格式定义错误: {}", e);
+                return Ok(ExitCode::FormatError);
+            }
         }
     };
 
@@ -307,6 +322,13 @@ fn load_format_def(
     data: &[u8],
 ) -> Result<FormatDefinition, Box<dyn std::error::Error>> {
     if let Some(fp) = format_path {
+        if let Some(ext) = fp.extension().and_then(|e| e.to_str()) {
+            if ext == "bfmt" {
+                let mut file = fs::File::open(fp)?;
+                return Ok(load_from_bfmt(&mut file)
+                    .map_err(|e| format!("二进制格式定义加载错误: {}", e))?);
+            }
+        }
         let yaml = fs::read_to_string(fp)?;
         Ok(FormatDefinition::from_yaml(&yaml).map_err(|e| format!("格式定义错误: {}", e))?)
     } else if let Some(builtin) = builtin_format {
@@ -320,6 +342,56 @@ fn load_format_def(
             }
         }
     }
+}
+
+fn run_compile(
+    input: &Path,
+    output: &Path,
+    include_debug: bool,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let yaml = match fs::read_to_string(input) {
+        Ok(y) => y,
+        Err(e) => {
+            eprintln!("读取输入文件失败: {}", e);
+            return Ok(ExitCode::FormatError);
+        }
+    };
+    let def = match FormatDefinition::from_yaml(&yaml) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("YAML解析错误: {}", e);
+            return Ok(ExitCode::FormatError);
+        }
+    };
+    let mut file = fs::File::create(output)?;
+    let size = compile_to_bfmt(&def, &mut file, include_debug)?;
+    let struct_count = def.structs.len() + 1;
+    let enum_count = def.enums.len();
+    let field_count = count_fields(&def);
+    println!("编译成功!");
+    println!("  输出文件: {}", output.display());
+    println!("  文件大小: {} 字节", size);
+    println!("  结构体: {} 个", struct_count);
+    println!("  枚举: {} 个", enum_count);
+    println!("  字段: {} 个", field_count);
+    Ok(ExitCode::Success)
+}
+
+fn run_decompile(
+    input: &Path,
+    output: Option<&Path>,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let mut file = fs::File::open(input)?;
+    let def = load_from_bfmt(&mut file)
+        .map_err(|e| format!("二进制格式定义加载错误: {}", e))?;
+    let yaml = decompile_to_yaml(&def)?;
+    if let Some(output_path) = output {
+        fs::write(output_path, &yaml)?;
+        println!("反编译成功，输出文件: {}", output_path.display());
+    } else {
+        print!("{}", yaml);
+    }
+    Ok(ExitCode::Success)
 }
 
 fn format_output(parsed: &parser::ParsedField, format_name: &str, fmt: OutputFormat) -> String {
