@@ -92,7 +92,19 @@ fn compare_children(children1: &[ParsedField], children2: &[ParsedField]) -> Vec
                     truncated: f1.truncated,
                     undecidable: f1.undecidable,
                     skipped: f1.skipped,
-                    children: Vec::new(),
+                    children: f1.children.iter().map(|c| DiffField {
+                        path: c.path.clone(),
+                        name: c.name.clone(),
+                        offset: c.offset,
+                        length: c.length,
+                        value1: c.value.display(c.display_format),
+                        value2: "<missing>".to_string(),
+                        is_different: true,
+                        truncated: c.truncated,
+                        undecidable: c.undecidable,
+                        skipped: c.skipped,
+                        children: Vec::new(),
+                    }).collect(),
                 });
             }
             (None, Some(f2)) => {
@@ -107,7 +119,19 @@ fn compare_children(children1: &[ParsedField], children2: &[ParsedField]) -> Vec
                     truncated: f2.truncated,
                     undecidable: f2.undecidable,
                     skipped: f2.skipped,
-                    children: Vec::new(),
+                    children: f2.children.iter().map(|c| DiffField {
+                        path: c.path.clone(),
+                        name: c.name.clone(),
+                        offset: c.offset,
+                        length: c.length,
+                        value1: "<missing>".to_string(),
+                        value2: c.value.display(c.display_format),
+                        is_different: true,
+                        truncated: c.truncated,
+                        undecidable: c.undecidable,
+                        skipped: c.skipped,
+                        children: Vec::new(),
+                    }).collect(),
                 });
             }
             (None, None) => unreachable!(),
@@ -120,10 +144,10 @@ fn compare_children(children1: &[ParsedField], children2: &[ParsedField]) -> Vec
 
 pub fn diff(root1: &ParsedField, root2: &ParsedField) -> DiffResult {
     let root_diff = compare_fields(root1, root2);
-    let fields = root_diff.children;
+    let root_diff_clone = root_diff.clone();
     
-    let total_fields = count_fields(&fields);
-    let different_fields = count_different_fields(&fields);
+    let total_fields = count_fields(&[root_diff_clone.clone()]);
+    let different_fields = count_different_fields(&[root_diff_clone]);
     let diff_rate = if total_fields > 0 {
         different_fields as f64 / total_fields as f64
     } else {
@@ -131,7 +155,7 @@ pub fn diff(root1: &ParsedField, root2: &ParsedField) -> DiffResult {
     };
 
     DiffResult {
-        fields,
+        fields: root_diff.children,
         total_fields,
         different_fields,
         diff_rate,
@@ -141,8 +165,8 @@ pub fn diff(root1: &ParsedField, root2: &ParsedField) -> DiffResult {
 fn count_fields(fields: &[DiffField]) -> usize {
     let mut count = 0;
     for field in fields {
-        if !matches!(field.value1.as_str(), "<struct>" | "<missing>") 
-            || !matches!(field.value2.as_str(), "<struct>" | "<missing>") {
+        let has_struct_children = !field.children.is_empty();
+        if !has_struct_children {
             count += 1;
         }
         count += count_fields(&field.children);
@@ -153,7 +177,8 @@ fn count_fields(fields: &[DiffField]) -> usize {
 fn count_different_fields(fields: &[DiffField]) -> usize {
     let mut count = 0;
     for field in fields {
-        if field.is_different && !matches!(field.value1.as_str(), "<struct>") && !matches!(field.value2.as_str(), "<struct>") {
+        let has_struct_children = !field.children.is_empty();
+        if field.is_different && !has_struct_children {
             count += 1;
         }
         count += count_different_fields(&field.children);

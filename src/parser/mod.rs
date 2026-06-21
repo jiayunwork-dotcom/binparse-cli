@@ -372,7 +372,7 @@ impl<'a> Parser<'a> {
         field_path: &str,
         offset: usize,
     ) -> Result<ParsedField> {
-        let (value, length) = self.parse_value(&field_def.data_type, field_def.endian, offset, field_path)?;
+        let (value, length, children) = self.parse_value(&field_def.data_type, field_def.endian, offset, field_path)?;
 
         let checksum_result = if let Some(checksum_def) = &field_def.checksum {
             let start = self.eval_expression_usize(&checksum_def.start)?;
@@ -439,7 +439,7 @@ impl<'a> Parser<'a> {
             undecidable: false,
             skipped: false,
             checksum_result,
-            children: Vec::new(),
+            children,
         })
     }
 
@@ -449,11 +449,11 @@ impl<'a> Parser<'a> {
         endian: Endian,
         offset: usize,
         path: &str,
-    ) -> Result<(ParsedValue, usize)> {
+    ) -> Result<(ParsedValue, usize, Vec<ParsedField>)> {
         match data_type {
             DataType::U8 => {
                 self.check_available(offset, 1)?;
-                Ok((ParsedValue::U8(self.data[offset]), 1))
+                Ok((ParsedValue::U8(self.data[offset]), 1, Vec::new()))
             }
             DataType::U16 => {
                 self.check_available(offset, 2)?;
@@ -462,7 +462,7 @@ impl<'a> Parser<'a> {
                     Endian::Little => u16::from_le_bytes(bytes.try_into().unwrap()),
                     Endian::Big => u16::from_be_bytes(bytes.try_into().unwrap()),
                 };
-                Ok((ParsedValue::U16(val), 2))
+                Ok((ParsedValue::U16(val), 2, Vec::new()))
             }
             DataType::U32 => {
                 self.check_available(offset, 4)?;
@@ -471,7 +471,7 @@ impl<'a> Parser<'a> {
                     Endian::Little => u32::from_le_bytes(bytes.try_into().unwrap()),
                     Endian::Big => u32::from_be_bytes(bytes.try_into().unwrap()),
                 };
-                Ok((ParsedValue::U32(val), 4))
+                Ok((ParsedValue::U32(val), 4, Vec::new()))
             }
             DataType::U64 => {
                 self.check_available(offset, 8)?;
@@ -480,11 +480,11 @@ impl<'a> Parser<'a> {
                     Endian::Little => u64::from_le_bytes(bytes.try_into().unwrap()),
                     Endian::Big => u64::from_be_bytes(bytes.try_into().unwrap()),
                 };
-                Ok((ParsedValue::U64(val), 8))
+                Ok((ParsedValue::U64(val), 8, Vec::new()))
             }
             DataType::I8 => {
                 self.check_available(offset, 1)?;
-                Ok((ParsedValue::I8(self.data[offset] as i8), 1))
+                Ok((ParsedValue::I8(self.data[offset] as i8), 1, Vec::new()))
             }
             DataType::I16 => {
                 self.check_available(offset, 2)?;
@@ -493,7 +493,7 @@ impl<'a> Parser<'a> {
                     Endian::Little => i16::from_le_bytes(bytes.try_into().unwrap()),
                     Endian::Big => i16::from_be_bytes(bytes.try_into().unwrap()),
                 };
-                Ok((ParsedValue::I16(val), 2))
+                Ok((ParsedValue::I16(val), 2, Vec::new()))
             }
             DataType::I32 => {
                 self.check_available(offset, 4)?;
@@ -502,7 +502,7 @@ impl<'a> Parser<'a> {
                     Endian::Little => i32::from_le_bytes(bytes.try_into().unwrap()),
                     Endian::Big => i32::from_be_bytes(bytes.try_into().unwrap()),
                 };
-                Ok((ParsedValue::I32(val), 4))
+                Ok((ParsedValue::I32(val), 4, Vec::new()))
             }
             DataType::I64 => {
                 self.check_available(offset, 8)?;
@@ -511,7 +511,7 @@ impl<'a> Parser<'a> {
                     Endian::Little => i64::from_le_bytes(bytes.try_into().unwrap()),
                     Endian::Big => i64::from_be_bytes(bytes.try_into().unwrap()),
                 };
-                Ok((ParsedValue::I64(val), 8))
+                Ok((ParsedValue::I64(val), 8, Vec::new()))
             }
             DataType::F32 => {
                 self.check_available(offset, 4)?;
@@ -520,7 +520,7 @@ impl<'a> Parser<'a> {
                     Endian::Little => f32::from_le_bytes(bytes.try_into().unwrap()),
                     Endian::Big => f32::from_be_bytes(bytes.try_into().unwrap()),
                 };
-                Ok((ParsedValue::F32(val), 4))
+                Ok((ParsedValue::F32(val), 4, Vec::new()))
             }
             DataType::F64 => {
                 self.check_available(offset, 8)?;
@@ -529,13 +529,13 @@ impl<'a> Parser<'a> {
                     Endian::Little => f64::from_le_bytes(bytes.try_into().unwrap()),
                     Endian::Big => f64::from_be_bytes(bytes.try_into().unwrap()),
                 };
-                Ok((ParsedValue::F64(val), 8))
+                Ok((ParsedValue::F64(val), 8, Vec::new()))
             }
             DataType::Bytes { length } => {
                 let len = self.eval_expression_usize(length)?;
                 self.check_available(offset, len)?;
                 let bytes = self.data[offset..offset + len].to_vec();
-                Ok((ParsedValue::Bytes(bytes), len))
+                Ok((ParsedValue::Bytes(bytes), len, Vec::new()))
             }
             DataType::String { length, encoding } => {
                 let len = self.eval_expression_usize(length)?;
@@ -546,14 +546,14 @@ impl<'a> Parser<'a> {
                     "utf8" => String::from_utf8_lossy(bytes).to_string(),
                     _ => String::from_utf8_lossy(bytes).to_string(),
                 };
-                Ok((ParsedValue::String(s), len))
+                Ok((ParsedValue::String(s), len, Vec::new()))
             }
             DataType::BitField { bit_start, bit_length } => {
                 self.check_available(offset, 1)?;
                 let byte = self.data[offset];
                 let mask = (1 << bit_length) - 1;
                 let val = (byte >> bit_start) & mask;
-                Ok((ParsedValue::BitField(val as u64), 1))
+                Ok((ParsedValue::BitField(val as u64), 1, Vec::new()))
             }
             DataType::Struct { name } => {
                 let struct_def = self.format.get_struct(name)
@@ -561,7 +561,7 @@ impl<'a> Parser<'a> {
                 let parsed = self.parse_struct(struct_def, path.rsplitn(2, '.').nth(1).unwrap_or(""), offset)?;
                 let len = parsed.length;
                 let children = parsed.children;
-                Ok((ParsedValue::Struct(children.clone()), len))
+                Ok((ParsedValue::Struct(children.clone()), len, children))
             }
             DataType::Array { element_type, length } => {
                 let array_len = self.eval_expression_usize(length)?;
@@ -569,11 +569,11 @@ impl<'a> Parser<'a> {
                 let mut current_offset = offset;
                 for i in 0..array_len {
                     let elem_path = format!("{}[{}]", path, i);
-                    let (val, len) = self.parse_value(element_type, endian, current_offset, &elem_path)?;
+                    let (val, len, _) = self.parse_value(element_type, endian, current_offset, &elem_path)?;
                     elements.push(val);
                     current_offset += len;
                 }
-                Ok((ParsedValue::Array(elements), current_offset - offset))
+                Ok((ParsedValue::Array(elements), current_offset - offset, Vec::new()))
             }
             DataType::Enum { underlying, .. } => {
                 self.parse_value(underlying, endian, offset, path)
