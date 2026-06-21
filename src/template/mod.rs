@@ -2,7 +2,7 @@ use crate::dsl::*;
 use evalexpr::ContextWithMutableVariables;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -23,6 +23,10 @@ pub enum TemplateError {
     IoError(#[from] std::io::Error),
     #[error("条件表达式求值错误: {0}")]
     ExpressionError(String),
+    #[error("超过最大继承深度 (最多3层)")]
+    MaxInheritanceDepthExceeded,
+    #[error("模板继承错误: {0}")]
+    InheritanceError(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,6 +58,8 @@ pub struct TemplateParameter {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TemplateDefinition {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extends: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parameters: Option<Vec<TemplateParameter>>,
     pub name: String,
@@ -95,12 +101,170 @@ pub struct TemplateField {
     pub template_when: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_repeat: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub override_field: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstanceConfig {
     pub template_path: String,
     pub parameters: HashMap<String, serde_yaml::Value>,
+}
+
+const MAX_INHERITANCE_DEPTH: usize = 3;
+
+#[derive(Debug, Clone)]
+pub struct MergedParamInfo {
+    pub param: TemplateParameter,
+    pub overridden: bool,
+}
+
+fn load_inheritance_chain(
+    template: &TemplateDefinition,
+    base_path: &Path,
+) -> Result<Vec<TemplateDefinition>, TemplateError> {
+    let mut chain = vec![template.clone()];
+    let mut current_extends = template.extends.clone();
+    let mut current_dir = base_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+
+    while let Some(extends_path) = current_extends.take() {
+        let parent_path = if Path::new(&extends_path).is_absolute() {
+            PathBuf::from(&extends_path)
+        } else {
+            current_dir.join(&extends_path)
+        };
+
+        if !parent_path.exists() {
+            return Err(TemplateError::InheritanceError(format!(
+                "父模板路径不存在: {}", parent_path.display()
+            )));
+        }
+
+        let parent = TemplateDefinition::from_file(&parent_path)?;
+        current_dir = parent_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+        current_extends = parent.extends.clone();
+        chain.push(parent);
+    }
+
+    if chain.len() > MAX_INHERITANCE_DEPTH {
+        return Err(TemplateError::MaxInheritanceDepthExceeded);
+    }
+
+    Ok(chain)
+}
+
+fn merge_inheritance_chain(chain: &[TemplateDefinition]) -> TemplateDefinition {
+    if chain.len() == 1 {
+        return chain[0].clone();
+    }
+
+    let child = &chain[0];
+    let parents = &chain[1..];
+    let mut merged_params: Vec<TemplateParameter> = Vec::new();
+    let mut merged_root_fields: Vec<TemplateField> = Vec::new();
+
+    for parent in parents.iter().rev() {
+        if let Some(parent_params) = &parent.parameters {
+            for pp in parent_params {
+                if let Some(existing) = merged_params.iter_mut().find(|p| p.name == pp.name) {
+                    *existing = pp.clone();
+                } else {
+                    merged_params.push(pp.clone());
+                }
+            }
+        }
+
+        for field in &parent.root.fields {
+            merged_root_fields.push(field.clone());
+        }
+    }
+
+    if let Some(child_params) = &child.parameters {
+        for cp in child_params {
+            if let Some(existing) = merged_params.iter_mut().find(|p| p.name == cp.name) {
+                *existing = cp.clone();
+            } else {
+                merged_params.push(cp.clone());
+            }
+        }
+    }
+
+    let mut override_fields: Vec<&TemplateField> = Vec::new();
+    let mut append_fields: Vec<TemplateField> = Vec::new();
+
+    for field in &child.root.fields {
+        if field.override_field.is_some() {
+            override_fields.push(field);
+        } else {
+            let mut f = field.clone();
+            f.override_field = None;
+            append_fields.push(f);
+        }
+    }
+
+    for field in &override_fields {
+        let target_name = field.override_field.as_ref().unwrap();
+        if let Some(pos) = merged_root_fields.iter().position(|f| f.name == *target_name) {
+            let mut replacement = (*field).clone();
+            replacement.override_field = None;
+            replacement.name = target_name.clone();
+            merged_root_fields[pos] = replacement;
+        }
+    }
+
+    merged_root_fields.extend(append_fields);
+
+    let mut merged_enums: Vec<EnumDefinition> = Vec::new();
+    for parent in parents.iter().rev() {
+        for e in &parent.enums {
+            if !merged_enums.iter().any(|me| me.name == e.name) {
+                merged_enums.push(e.clone());
+            }
+        }
+    }
+    for e in &child.enums {
+        if let Some(existing) = merged_enums.iter_mut().find(|me| me.name == e.name) {
+            *existing = e.clone();
+        } else {
+            merged_enums.push(e.clone());
+        }
+    }
+
+    let mut merged_structs: Vec<TemplateStructDefinition> = Vec::new();
+    for parent in parents.iter().rev() {
+        for s in &parent.structs {
+            if !merged_structs.iter().any(|ms| ms.name == s.name) {
+                merged_structs.push(s.clone());
+            }
+        }
+    }
+    for s in &child.structs {
+        if let Some(existing) = merged_structs.iter_mut().find(|ms| ms.name == s.name) {
+            *existing = s.clone();
+        } else {
+            merged_structs.push(s.clone());
+        }
+    }
+
+    let merged_magic = child.magic.clone().or_else(|| {
+        parents.iter().rev().find_map(|p| p.magic.clone())
+    });
+
+    TemplateDefinition {
+        extends: None,
+        parameters: if merged_params.is_empty() { None } else { Some(merged_params) },
+        name: child.name.clone(),
+        magic: merged_magic,
+        enums: merged_enums,
+        structs: merged_structs,
+        root: TemplateStructDefinition {
+            name: child.root.name.clone(),
+            magic: child.root.magic.clone().or_else(|| {
+                parents.iter().rev().find_map(|p| p.root.magic.clone())
+            }),
+            fields: merged_root_fields,
+        },
+    }
 }
 
 impl TemplateDefinition {
@@ -116,6 +280,67 @@ impl TemplateDefinition {
 
     pub fn get_parameters(&self) -> &[TemplateParameter] {
         self.parameters.as_ref().map(|p| p.as_slice()).unwrap_or(&[])
+    }
+
+    pub fn resolve_inheritance(&self, base_path: &Path) -> Result<TemplateDefinition, TemplateError> {
+        if self.extends.is_none() {
+            return Ok(self.clone());
+        }
+        let chain = load_inheritance_chain(self, base_path)?;
+        Ok(merge_inheritance_chain(&chain))
+    }
+
+    pub fn instantiate_with_inheritance(
+        &self,
+        instance_params: &HashMap<String, serde_yaml::Value>,
+        base_path: &Path,
+    ) -> Result<FormatDefinition, TemplateError> {
+        let resolved_template = self.resolve_inheritance(base_path)?;
+        resolved_template.instantiate(instance_params)
+    }
+
+    pub fn get_merged_params(&self, base_path: &Path) -> Result<Vec<MergedParamInfo>, TemplateError> {
+        if self.extends.is_none() {
+            let params = self.get_parameters().iter().map(|p| MergedParamInfo {
+                param: p.clone(),
+                overridden: false,
+            }).collect();
+            return Ok(params);
+        }
+
+        let chain = load_inheritance_chain(self, base_path)?;
+        let parents = &chain[1..];
+
+        let mut all_params: Vec<MergedParamInfo> = Vec::new();
+
+        for parent in parents.iter().rev() {
+            if let Some(parent_params) = &parent.parameters {
+                for pp in parent_params {
+                    all_params.push(MergedParamInfo {
+                        param: pp.clone(),
+                        overridden: false,
+                    });
+                }
+            }
+        }
+
+        if let Some(child_params) = &self.parameters {
+            for cp in child_params {
+                if let Some(existing_idx) = all_params.iter().position(|mp| mp.param.name == cp.name) {
+                    all_params[existing_idx] = MergedParamInfo {
+                        param: cp.clone(),
+                        overridden: true,
+                    };
+                } else {
+                    all_params.push(MergedParamInfo {
+                        param: cp.clone(),
+                        overridden: false,
+                    });
+                }
+            }
+        }
+
+        Ok(all_params)
     }
 
     fn resolve_parameters(
@@ -256,6 +481,98 @@ impl TemplateDefinition {
         for s in &self.structs {
             self.validate_struct_template(s, &param_names, &mut errors);
         }
+
+        errors
+    }
+
+    pub fn validate_template_with_inheritance(&self, base_path: &Path) -> Vec<TemplateValidationError> {
+        let mut errors = Vec::new();
+
+        if self.extends.is_some() {
+            let mut chain: Vec<TemplateDefinition> = vec![self.clone()];
+            let mut current_extends = self.extends.clone();
+            let mut current_dir = base_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+
+            while let Some(extends_path) = current_extends.take() {
+                let parent_path = if Path::new(&extends_path).is_absolute() {
+                    PathBuf::from(&extends_path)
+                } else {
+                    current_dir.join(&extends_path)
+                };
+
+                if !parent_path.exists() {
+                    errors.push(TemplateValidationError {
+                        location: "extends".to_string(),
+                        reason: format!("父模板路径不存在: {}", parent_path.display()),
+                    });
+                    break;
+                }
+
+                match TemplateDefinition::from_file(&parent_path) {
+                    Ok(parent) => {
+                        current_dir = parent_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+                        current_extends = parent.extends.clone();
+                        chain.push(parent);
+                    }
+                    Err(e) => {
+                        errors.push(TemplateValidationError {
+                            location: "extends".to_string(),
+                            reason: format!("无法加载父模板: {}", e),
+                        });
+                        break;
+                    }
+                }
+            }
+
+            if chain.len() > MAX_INHERITANCE_DEPTH {
+                errors.push(TemplateValidationError {
+                    location: "extends".to_string(),
+                    reason: format!("继承链超过最大深度 (最多{}层)", MAX_INHERITANCE_DEPTH),
+                });
+            }
+
+            if chain.len() > 1 {
+                let parent = &chain[1];
+
+                let parent_field_names: std::collections::HashSet<&str> =
+                    parent.root.fields.iter().map(|f| f.name.as_str()).collect();
+
+                for field in &self.root.fields {
+                    if let Some(override_target) = &field.override_field {
+                        if !parent_field_names.contains(override_target.as_str()) {
+                            errors.push(TemplateValidationError {
+                                location: format!("{}.{}", self.root.name, field.name),
+                                reason: format!(
+                                    "override_field引用的字段名 '{}' 在父模板中不存在",
+                                    override_target
+                                ),
+                            });
+                        }
+                    }
+                }
+
+                if let Some(parent_params) = &parent.parameters {
+                    if let Some(child_params) = &self.parameters {
+                        for cp in child_params {
+                            if let Some(pp) = parent_params.iter().find(|p| p.name == cp.name) {
+                                if pp.param_type != cp.param_type {
+                                    errors.push(TemplateValidationError {
+                                        location: format!("parameters.{}", cp.name),
+                                        reason: format!(
+                                            "与父模板参数类型冲突: 父模板类型为 {}, 子模板类型为 {}",
+                                            pp.param_type, cp.param_type
+                                        ),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut self_errors = self.validate_template();
+        errors.append(&mut self_errors);
 
         errors
     }
@@ -708,6 +1025,44 @@ pub fn format_params_table(params: &[TemplateParameter]) -> String {
     table
 }
 
+pub fn format_merged_params_table(params: &[MergedParamInfo]) -> String {
+    let mut table = String::new();
+    table.push_str(&format!(
+        "{:<20} {:<10} {:<15} {:<10} {:<6}\n",
+        "名称", "类型", "默认值", "必填", "来源"
+    ));
+    table.push_str(&format!(
+        "{:<20} {:<10} {:<15} {:<10} {:<6}\n",
+        "----", "----", "------", "----", "----"
+    ));
+    for info in params {
+        let default_str = match &info.param.default {
+            Some(v) => match v {
+                serde_yaml::Value::Number(n) => n.to_string(),
+                serde_yaml::Value::Bool(b) => b.to_string(),
+                serde_yaml::Value::String(s) => s.clone(),
+                _ => format!("{:?}", v),
+            },
+            None => "-".to_string(),
+        };
+        let required = if info.param.default.is_some() {
+            "否"
+        } else {
+            "是"
+        };
+        let name_display = if info.overridden {
+            format!("{} (覆盖)", info.param.name)
+        } else {
+            info.param.name.clone()
+        };
+        table.push_str(&format!(
+            "{:<20} {:<10} {:<15} {:<10}\n",
+            name_display, info.param.param_type, default_str, required
+        ));
+    }
+    table
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1009,5 +1364,376 @@ root:
         let template = TemplateDefinition::from_yaml(yaml).unwrap();
         let errors = template.validate_template();
         assert!(errors.iter().any(|e| e.reason.contains("default值类型与声明类型不匹配")));
+    }
+
+    #[test]
+    fn test_extends_field_parsed() {
+        let yaml = r#"
+extends: parent.yaml
+name: Child
+root:
+  name: Header
+  fields:
+    - name: magic
+      type: u32
+      offset: "0"
+"#;
+        let template = TemplateDefinition::from_yaml(yaml).unwrap();
+        assert_eq!(template.extends, Some("parent.yaml".to_string()));
+    }
+
+    #[test]
+    fn test_override_field_parsed() {
+        let yaml = r#"
+name: Test
+root:
+  name: Header
+  fields:
+    - name: checksum
+      type: u64
+      offset: relative
+      override_field: checksum
+"#;
+        let template = TemplateDefinition::from_yaml(yaml).unwrap();
+        assert_eq!(template.root.fields[0].override_field, Some("checksum".to_string()));
+    }
+
+    #[test]
+    fn test_merge_inheritance_chain_params_override() {
+        let parent_yaml = r#"
+parameters:
+  - name: header_size
+    type: int
+    default: 16
+  - name: version
+    type: int
+    default: 1
+name: Parent
+root:
+  name: Header
+  fields:
+    - name: magic
+      type: u32
+      offset: "0"
+"#;
+        let child_yaml = r#"
+extends: parent.yaml
+parameters:
+  - name: version
+    type: int
+    default: 2
+name: Child
+root:
+  name: Header
+  fields:
+    - name: extra
+      type: u32
+      offset: relative
+"#;
+        let parent = TemplateDefinition::from_yaml(parent_yaml).unwrap();
+        let child = TemplateDefinition::from_yaml(child_yaml).unwrap();
+        let chain = vec![child, parent];
+        let merged = merge_inheritance_chain(&chain);
+
+        let params = merged.get_parameters();
+        assert_eq!(params.len(), 2);
+        let version_param = params.iter().find(|p| p.name == "version").unwrap();
+        assert_eq!(version_param.default, Some(serde_yaml::Value::Number(2.into())));
+        let header_size_param = params.iter().find(|p| p.name == "header_size").unwrap();
+        assert_eq!(header_size_param.default, Some(serde_yaml::Value::Number(16.into())));
+    }
+
+    #[test]
+    fn test_merge_inheritance_chain_fields_append() {
+        let parent_yaml = r#"
+name: Parent
+root:
+  name: Header
+  fields:
+    - name: magic
+      type: u32
+      offset: "0"
+    - name: version
+      type: u16
+      offset: relative
+"#;
+        let child_yaml = r#"
+extends: parent.yaml
+name: Child
+root:
+  name: Header
+  fields:
+    - name: extra
+      type: u32
+      offset: relative
+"#;
+        let parent = TemplateDefinition::from_yaml(parent_yaml).unwrap();
+        let child = TemplateDefinition::from_yaml(child_yaml).unwrap();
+        let chain = vec![child, parent];
+        let merged = merge_inheritance_chain(&chain);
+
+        assert_eq!(merged.root.fields.len(), 3);
+        assert_eq!(merged.root.fields[0].name, "magic");
+        assert_eq!(merged.root.fields[1].name, "version");
+        assert_eq!(merged.root.fields[2].name, "extra");
+    }
+
+    #[test]
+    fn test_merge_inheritance_chain_override_field() {
+        let parent_yaml = r#"
+name: Parent
+root:
+  name: Header
+  fields:
+    - name: magic
+      type: u32
+      offset: "0"
+    - name: checksum
+      type: u16
+      offset: relative
+"#;
+        let child_yaml = r#"
+extends: parent.yaml
+name: Child
+root:
+  name: Header
+  fields:
+    - name: overridden_checksum
+      type: u64
+      offset: relative
+      override_field: checksum
+"#;
+        let parent = TemplateDefinition::from_yaml(parent_yaml).unwrap();
+        let child = TemplateDefinition::from_yaml(child_yaml).unwrap();
+        let chain = vec![child, parent];
+        let merged = merge_inheritance_chain(&chain);
+
+        assert_eq!(merged.root.fields.len(), 2);
+        assert_eq!(merged.root.fields[0].name, "magic");
+        assert_eq!(merged.root.fields[1].name, "checksum");
+        assert_eq!(merged.root.fields[1].override_field, None);
+        match &merged.root.fields[1].data_type {
+            serde_yaml::Value::String(s) => assert_eq!(s, "u64"),
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn test_get_merged_params_override_marker() {
+        let parent_yaml = r#"
+parameters:
+  - name: header_size
+    type: int
+    default: 16
+  - name: version
+    type: int
+    default: 1
+name: Parent
+root:
+  name: Header
+  fields:
+    - name: magic
+      type: u32
+      offset: "0"
+"#;
+        let child_yaml = r#"
+extends: test_parent_template.yaml
+parameters:
+  - name: version
+    type: int
+    default: 2
+name: Child
+root:
+  name: Header
+  fields: []
+"#;
+        let _parent = TemplateDefinition::from_yaml(parent_yaml).unwrap();
+        let child = TemplateDefinition::from_yaml(child_yaml).unwrap();
+
+        let parent_dir = std::env::temp_dir();
+        let parent_path = parent_dir.join("test_parent_template.yaml");
+        std::fs::write(&parent_path, parent_yaml).unwrap();
+
+        let child_path = parent_dir.join("test_child_template.yaml");
+        std::fs::write(&child_path, child_yaml).unwrap();
+
+        let result = child.get_merged_params(&child_path).unwrap();
+        assert_eq!(result.len(), 2);
+        let version_info = result.iter().find(|p| p.param.name == "version").unwrap();
+        assert!(version_info.overridden);
+        let header_info = result.iter().find(|p| p.param.name == "header_size").unwrap();
+        assert!(!header_info.overridden);
+
+        let _ = std::fs::remove_file(&parent_path);
+        let _ = std::fs::remove_file(&child_path);
+    }
+
+    #[test]
+    fn test_validate_template_with_inheritance_type_conflict() {
+        let parent_yaml = r#"
+parameters:
+  - name: size
+    type: int
+    default: 16
+name: Parent
+root:
+  name: Header
+  fields:
+    - name: magic
+      type: u32
+      offset: "0"
+"#;
+        let child_yaml = r#"
+extends: test_validate_parent.yaml
+parameters:
+  - name: size
+    type: string
+name: Child
+root:
+  name: Header
+  fields: []
+"#;
+        let _parent = TemplateDefinition::from_yaml(parent_yaml).unwrap();
+        let child = TemplateDefinition::from_yaml(child_yaml).unwrap();
+
+        let parent_dir = std::env::temp_dir();
+        let parent_path = parent_dir.join("test_validate_parent.yaml");
+        std::fs::write(&parent_path, parent_yaml).unwrap();
+
+        let child_path = parent_dir.join("test_validate_child.yaml");
+        std::fs::write(&child_path, child_yaml).unwrap();
+
+        let errors = child.validate_template_with_inheritance(&child_path);
+        assert!(errors.iter().any(|e| e.reason.contains("参数类型冲突")));
+
+        let _ = std::fs::remove_file(&parent_path);
+        let _ = std::fs::remove_file(&child_path);
+    }
+
+    #[test]
+    fn test_validate_template_override_field_not_in_parent() {
+        let parent_yaml = r#"
+name: Parent
+root:
+  name: Header
+  fields:
+    - name: magic
+      type: u32
+      offset: "0"
+"#;
+        let child_yaml = r#"
+extends: test_override_parent.yaml
+name: Child
+root:
+  name: Header
+  fields:
+    - name: foo
+      type: u64
+      override_field: nonexistent_field
+"#;
+        let _parent = TemplateDefinition::from_yaml(parent_yaml).unwrap();
+        let child = TemplateDefinition::from_yaml(child_yaml).unwrap();
+
+        let parent_dir = std::env::temp_dir();
+        let parent_path = parent_dir.join("test_override_parent.yaml");
+        std::fs::write(&parent_path, parent_yaml).unwrap();
+
+        let child_path = parent_dir.join("test_override_child.yaml");
+        std::fs::write(&child_path, child_yaml).unwrap();
+
+        let errors = child.validate_template_with_inheritance(&child_path);
+        assert!(errors.iter().any(|e| e.reason.contains("override_field引用的字段名") && e.reason.contains("在父模板中不存在")));
+
+        let _ = std::fs::remove_file(&parent_path);
+        let _ = std::fs::remove_file(&child_path);
+    }
+
+    #[test]
+    fn test_merge_three_level_inheritance() {
+        let grandparent_yaml = r#"
+parameters:
+  - name: base_size
+    type: int
+    default: 8
+  - name: version
+    type: int
+    default: 1
+name: GrandParent
+root:
+  name: Header
+  fields:
+    - name: magic
+      type: u32
+      offset: "0"
+    - name: base_field
+      type: u16
+      offset: relative
+"#;
+        let parent_yaml = r#"
+extends: grandparent.yaml
+parameters:
+  - name: version
+    type: int
+    default: 2
+  - name: has_checksum
+    type: bool
+    default: true
+name: Parent
+root:
+  name: Header
+  fields:
+    - name: parent_field
+      type: u16
+      offset: relative
+"#;
+        let child_yaml = r#"
+extends: parent.yaml
+parameters:
+  - name: extra_param
+    type: string
+    default: "hello"
+name: Child
+root:
+  name: Header
+  fields:
+    - name: child_field
+      type: u32
+      offset: relative
+"#;
+        let grandparent = TemplateDefinition::from_yaml(grandparent_yaml).unwrap();
+        let parent = TemplateDefinition::from_yaml(parent_yaml).unwrap();
+        let child = TemplateDefinition::from_yaml(child_yaml).unwrap();
+        let chain = vec![child, parent, grandparent];
+        let merged = merge_inheritance_chain(&chain);
+
+        assert_eq!(merged.root.fields.len(), 4);
+        assert_eq!(merged.root.fields[0].name, "magic");
+        assert_eq!(merged.root.fields[1].name, "base_field");
+        assert_eq!(merged.root.fields[2].name, "parent_field");
+        assert_eq!(merged.root.fields[3].name, "child_field");
+
+        let params = merged.get_parameters();
+        assert_eq!(params.len(), 4);
+        let version_param = params.iter().find(|p| p.name == "version").unwrap();
+        assert_eq!(version_param.default, Some(serde_yaml::Value::Number(2.into())));
+    }
+
+    #[test]
+    fn test_no_extends_preserves_existing_behavior() {
+        let yaml = r#"
+parameters:
+  - name: header_size
+    type: int
+    default: 16
+name: Test
+root:
+  name: Header
+  fields:
+    - name: magic
+      type: u32
+      offset: "0"
+"#;
+        let template = TemplateDefinition::from_yaml(yaml).unwrap();
+        assert!(template.extends.is_none());
     }
 }

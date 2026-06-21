@@ -322,7 +322,7 @@ fn run_instantiate(
         }
     };
 
-    let format_def = match template.instantiate(&config.parameters) {
+    let format_def = match template.instantiate_with_inheritance(&config.parameters, template_path) {
         Ok(d) => d,
         Err(TemplateError::ParameterTypeError { name, expected, value }) => {
             eprintln!("参数类型错误: 参数 '{}' 期望类型为 {}, 实际值为 '{}'", name, expected, value);
@@ -330,6 +330,14 @@ fn run_instantiate(
         }
         Err(TemplateError::MissingParameter(name)) => {
             eprintln!("缺少必填参数: '{}'", name);
+            return Ok(ExitCode::FormatError);
+        }
+        Err(TemplateError::MaxInheritanceDepthExceeded) => {
+            eprintln!("超过最大继承深度 (最多3层)");
+            return Ok(ExitCode::FormatError);
+        }
+        Err(TemplateError::InheritanceError(e)) => {
+            eprintln!("模板继承错误: {}", e);
             return Ok(ExitCode::FormatError);
         }
         Err(e) => {
@@ -369,7 +377,7 @@ fn run_validate_template(
         }
     };
 
-    let errors = template.validate_template();
+    let errors = template.validate_template_with_inheritance(template_path);
 
     if errors.is_empty() {
         println!("模板定义有效");
@@ -401,11 +409,26 @@ fn run_list_params(
         }
     };
 
-    let params = template.get_parameters();
-    if params.is_empty() {
-        println!("该模板没有声明任何参数");
+    if template.extends.is_some() {
+        let merged = match template.get_merged_params(template_path) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("解析模板继承参数失败: {}", e);
+                return Ok(ExitCode::FormatError);
+            }
+        };
+        if merged.is_empty() {
+            println!("该模板没有声明任何参数");
+        } else {
+            print!("{}", format_merged_params_table(&merged));
+        }
     } else {
-        print!("{}", format_params_table(params));
+        let params = template.get_parameters();
+        if params.is_empty() {
+            println!("该模板没有声明任何参数");
+        } else {
+            print!("{}", format_params_table(params));
+        }
     }
 
     Ok(ExitCode::Success)
@@ -530,7 +553,7 @@ fn run_compile(
         let template_path = Path::new(&instance_config.template_path);
         let template = TemplateDefinition::from_file(template_path)
             .map_err(|e| format!("读取模板定义失败: {}", e))?;
-        let def = template.instantiate(&instance_config.parameters)
+        let def = template.instantiate_with_inheritance(&instance_config.parameters, template_path)
             .map_err(|e| format!("模板实例化失败: {}", e))?;
         let yaml_result = serde_yaml::to_string(&def)
             .map_err(|e| format!("序列化实例化结果失败: {}", e))?;
