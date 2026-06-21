@@ -55,7 +55,7 @@ fn run(cli: Cli) -> Result<i32, Box<dyn std::error::Error>> {
             return Ok(run_decompile(input, output.as_deref())? as i32);
         }
         Some(Commands::DiffFormat { file1, file2 }) => {
-            return Ok(run_diff_format(file1, file2)? as i32);
+            return run_diff_format(file1, file2);
         }
         _ => {}
     }
@@ -756,7 +756,7 @@ fn load_format_from_file(path: &Path) -> Result<FormatDefinition, Box<dyn std::e
 fn run_diff_format(
     file1: &Path,
     file2: &Path,
-) -> Result<ExitCode, Box<dyn std::error::Error>> {
+) -> Result<i32, Box<dyn std::error::Error>> {
     let def1 = load_format_from_file(file1)?;
     let def2 = load_format_from_file(file2)?;
 
@@ -764,14 +764,14 @@ fn run_diff_format(
 
     if changes.is_empty() {
         println!("格式定义一致,无差异");
-        return Ok(ExitCode::Success);
+        return Ok(0);
     }
 
     for line in &changes {
         println!("{}", line);
     }
 
-    Ok(ExitCode::FormatError)
+    Ok(1)
 }
 
 fn diff_format_definitions(def1: &FormatDefinition, def2: &FormatDefinition) -> Vec<String> {

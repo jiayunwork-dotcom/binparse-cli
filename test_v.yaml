@@ -1,0 +1,79 @@
+
+name: PNG
+magic: [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
+enums:
+  - name: ColorType
+    values:
+      GRAYSCALE: 0
+      RGB: 2
+      INDEXED: 3
+      GRAYSCALE_ALPHA: 4
+      RGBA: 6
+structs:
+  - name: IHDRChunk
+    fields:
+      - name: length
+        type: u32
+        offset: "0"
+        endian: big
+        format: dec
+      - name: chunk_type
+        type:
+          string:
+            length: "4"
+            encoding: ascii
+        offset: relative
+      - name: width
+        type: u32
+        offset: relative
+        endian: big
+        format: dec
+      - name: height
+        type: u32
+        offset: relative
+        endian: big
+        format: dec
+      - name: bit_depth
+        type: u8
+        offset: relative
+        format: dec
+      - name: color_type
+        type:
+          enum:
+            name: ColorType
+            underlying: u8
+        offset: relative
+      - name: compression_method
+        type: u8
+        offset: relative
+        format: dec
+      - name: filter_method
+        type: u8
+        offset: relative
+        format: dec
+      - name: interlace_method
+        type: u8
+        offset: relative
+        format: dec
+      - name: crc
+        type: u32
+        offset: relative
+        endian: big
+        format: hex
+        checksum:
+          algorithm: crc32
+          start: "4"
+          end: "21"
+root:
+  name: PNGFile
+  fields:
+    - name: signature
+      type:
+        bytes:
+          length: "8"
+      offset: "0"
+      format: hex
+    - name: ihdr
+      type:
+        struct: IHDRChunk
+      offset: relative
