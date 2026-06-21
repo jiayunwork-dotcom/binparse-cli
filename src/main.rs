@@ -12,24 +12,35 @@ fn main() {
         Ok(code) => code,
         Err(e) => {
             eprintln!("Error: {}", e);
-            ExitCode::FormatError
+            ExitCode::FormatError as i32
         }
     };
 
-    process::exit(exit_code.into());
+    process::exit(exit_code);
 }
 
-fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
+fn run(cli: Cli) -> Result<i32, Box<dyn std::error::Error>> {
     match &cli.command {
         Some(Commands::ListFormats) => {
             list_formats();
-            return Ok(ExitCode::Success);
+            return Ok(ExitCode::Success as i32);
         }
         Some(Commands::ExportExample { format_name, output }) => {
-            return export_example(format_name, output.as_deref());
+            return Ok(export_example(format_name, output.as_deref())? as i32);
         }
         Some(Commands::Validate { format: format_path }) => {
-            return run_validate(format_path);
+            return Ok(run_validate(format_path)? as i32);
+        }
+        Some(Commands::Patch {
+            input,
+            output,
+            format,
+            builtin_format,
+            sets,
+            patch_file,
+            dry_run,
+        }) => {
+            return run_patch_cmd(input, output, format.as_deref(), builtin_format.as_deref(), sets, patch_file.as_deref(), *dry_run);
         }
         _ => {}
     }
@@ -46,7 +57,7 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         stats,
     }) = &cli.command
     {
-        return run_parse(file, format.as_deref(), builtin_format.as_deref(), output_format.clone(), *json, *no_tui, output.as_deref(), filter.as_deref(), *stats);
+        return Ok(run_parse(file, format.as_deref(), builtin_format.as_deref(), output_format.clone(), *json, *no_tui, output.as_deref(), filter.as_deref(), *stats)? as i32);
     }
 
     if let Some(Commands::Diff {
@@ -59,7 +70,7 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         filter,
     }) = &cli.command
     {
-        return run_diff(file1, file2, format.as_deref(), builtin_format.as_deref(), output_format.clone(), output.as_deref(), filter.as_deref());
+        return Ok(run_diff(file1, file2, format.as_deref(), builtin_format.as_deref(), output_format.clone(), output.as_deref(), filter.as_deref())? as i32);
     }
 
     let diff_path = cli.diff.clone();
@@ -72,7 +83,7 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
 
     if let Some(diff_file) = diff_path {
         let file1 = cli.file.ok_or("请指定第一个文件路径")?;
-        return run_diff(&file1, &diff_file, format_path.as_deref(), builtin_format.as_deref(), output_format, output_path.as_deref(), None);
+        return Ok(run_diff(&file1, &diff_file, format_path.as_deref(), builtin_format.as_deref(), output_format, output_path.as_deref(), None)? as i32);
     }
 
     let file_path = cli.file.ok_or("请指定二进制文件路径")?;
@@ -100,9 +111,9 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
     }
 
     Ok(if has_checksum_failure {
-        ExitCode::ChecksumFailure
+        ExitCode::ChecksumFailure as i32
     } else {
-        ExitCode::Success
+        ExitCode::Success as i32
     })
 }
 
@@ -408,4 +419,103 @@ fn export_example(format_name: &str, output: Option<&Path>) -> Result<ExitCode, 
     }
 
     Ok(ExitCode::Success)
+}
+
+fn run_patch_cmd(
+    input: &Path,
+    output: &Path,
+    format_path: Option<&Path>,
+    builtin_format: Option<&str>,
+    sets: &[String],
+    patch_file: Option<&Path>,
+    dry_run: bool,
+) -> Result<i32, Box<dyn std::error::Error>> {
+    if sets.is_empty() && patch_file.is_none() {
+        return Err("请至少指定一个--set参数或--patch-file参数".into());
+    }
+
+    let instructions = match patch::parse_patch_instructions(sets, patch_file) {
+        Ok(inst) => inst,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            return Ok(patch::PatchError::FORMAT_ERROR);
+        }
+    };
+
+    if instructions.is_empty() {
+        return Err("没有有效的修改指令".into());
+    }
+
+    let input_data = read_data(input)?;
+
+    let format_def = match load_format_def(format_path, builtin_format, &input_data) {
+        Ok(def) => def,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            return Ok(patch::PatchError::FORMAT_ERROR);
+        }
+    };
+
+    let (result, exit_code) = match patch::run_patch(&input_data, output, &format_def, &instructions, dry_run) {
+        Ok(r) => r,
+        Err(e) => {
+            let err_str = e.to_string();
+            if err_str.contains("字段路径不存在") {
+                eprintln!("Error: {}", e);
+                return Ok(patch::PatchError::FIELD_NOT_FOUND);
+            } else if err_str.contains("编码失败") || err_str.contains("值编码") || err_str.contains("超出范围") || err_str.contains("解析失败") {
+                eprintln!("Error: {}", e);
+                return Ok(patch::PatchError::VALUE_ENCODING_ERROR);
+            } else {
+                eprintln!("Error: {}", e);
+                return Ok(patch::PatchError::FORMAT_ERROR);
+            }
+        }
+    };
+
+    if dry_run {
+        println!("=== DRY-RUN: 计划修改 (未实际写入) ===");
+    } else {
+        println!("=== 修改摘要 ===");
+    }
+
+    println!("\n字段修改 (共{}项):", result.changes.len());
+    for change in &result.changes {
+        println!("\n  字段: {}", change.field_path);
+        println!("  偏移: 0x{:08X} ({}字节)", change.offset, change.length);
+        println!("  原值: {}", change.original_value_display);
+        println!("  新值: {}", change.new_value_display);
+        let orig_hex: String = change.original_bytes.iter().map(|b| format!("{:02X}", b)).collect();
+        let new_hex: String = change.new_bytes.iter().map(|b| format!("{:02X}", b)).collect();
+        println!("  原始字节: {}", orig_hex);
+        println!("  新字节:   {}", new_hex);
+    }
+
+    if !result.checksum_recalcs.is_empty() {
+        println!("\n校验和重算 (共{}项):", result.checksum_recalcs.len());
+        for cs in &result.checksum_recalcs {
+            println!("\n  字段: {}", cs.field_path);
+            println!("  算法: {}", cs.algorithm);
+            println!("  覆盖范围: 0x{:08X} - 0x{:08X}", cs.start, cs.end);
+            println!("  原校验值: 0x{:08X}", cs.original_value);
+            println!("  新校验值: 0x{:08X}", cs.new_value);
+        }
+    } else if dry_run {
+        println!("\n校验和重算: 无需要重算的校验和");
+    }
+
+    if !dry_run {
+        if !result.validation_failures.is_empty() {
+            eprintln!("\n=== 警告: 验证失败 ===");
+            for (path, expected, actual) in &result.validation_failures {
+                eprintln!("  字段 {}: 期望值={}, 实际解析值={}", path, expected, actual);
+            }
+        } else {
+            println!("\n验证通过: 所有修改字段已正确写入并重新解析确认。");
+        }
+
+        println!("\n输出文件: {}", output.display());
+    }
+
+    Ok(exit_code)
 }

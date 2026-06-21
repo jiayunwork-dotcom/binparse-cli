@@ -9,6 +9,7 @@ pub mod cli;
 pub mod validate;
 pub mod filter;
 pub mod stats;
+pub mod patch;
 
 pub use dsl::*;
 pub use parser::*;
@@ -20,3 +21,4 @@ pub use cli::*;
 pub use validate::*;
 pub use filter::*;
 pub use stats::*;
+pub use patch::*;

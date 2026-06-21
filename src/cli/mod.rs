@@ -101,6 +101,29 @@ pub enum Commands {
         #[arg(short, long, help = "输出文件路径")]
         output: Option<PathBuf>,
     },
+    #[command(about = "修补二进制文件中的指定字段")]
+    Patch {
+        #[arg(help = "源二进制文件路径")]
+        input: PathBuf,
+
+        #[arg(help = "输出文件路径")]
+        output: PathBuf,
+
+        #[arg(short = 'F', long, help = "YAML格式定义文件路径")]
+        format: Option<PathBuf>,
+
+        #[arg(short = 't', long, help = "使用内置格式 (png/bmp/wav/zip/elf/pe)")]
+        builtin_format: Option<String>,
+
+        #[arg(long = "set", help = "设置字段值，格式为\"字段路径=新值\"，可多次指定")]
+        sets: Vec<String>,
+
+        #[arg(long = "patch-file", help = "批量修改脚本文件路径，每行一条\"字段路径=新值\"指令")]
+        patch_file: Option<PathBuf>,
+
+        #[arg(long, help = "试运行模式，不实际写文件，只输出修改计划")]
+        dry_run: bool,
+    },
 }
 
 #[derive(clap::ValueEnum, Clone, Debug, PartialEq, Eq)]
