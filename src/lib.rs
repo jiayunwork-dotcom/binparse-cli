@@ -6,6 +6,9 @@ pub mod tui;
 pub mod diff;
 pub mod export;
 pub mod cli;
+pub mod validate;
+pub mod filter;
+pub mod stats;
 
 pub use dsl::*;
 pub use parser::*;
@@ -14,3 +17,6 @@ pub use checksum::*;
 pub use diff::*;
 pub use export::*;
 pub use cli::*;
+pub use validate::*;
+pub use filter::*;
+pub use stats::*;

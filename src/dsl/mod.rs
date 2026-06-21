@@ -246,6 +246,11 @@ impl FormatDefinition {
         Ok(def)
     }
 
+    pub fn from_yaml_unvalidated(yaml_str: &str) -> Result<Self, DslError> {
+        let def: FormatDefinition = serde_yaml::from_str(yaml_str)?;
+        Ok(def)
+    }
+
     pub fn validate(&self) -> Result<(), DslError> {
         self.check_circular_references()?;
         self.validate_struct_references()?;

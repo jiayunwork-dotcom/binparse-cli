@@ -10,7 +10,7 @@ pub struct Cli {
     #[arg(short, long, help = "二进制文件路径")]
     pub file: Option<PathBuf>,
 
-    #[arg(short, long, help = "YAML格式定义文件路径")]
+    #[arg(short = 'F', long, help = "YAML格式定义文件路径")]
     pub format: Option<PathBuf>,
 
     #[arg(short = 't', long, help = "使用内置格式 (png/bmp/wav/zip/elf/pe)")]
@@ -39,7 +39,7 @@ pub enum Commands {
         #[arg(help = "二进制文件路径")]
         file: PathBuf,
 
-        #[arg(short, long, help = "YAML格式定义文件路径")]
+        #[arg(short = 'F', long, help = "YAML格式定义文件路径")]
         format: Option<PathBuf>,
 
         #[arg(short = 't', long, help = "使用内置格式")]
@@ -56,6 +56,12 @@ pub enum Commands {
 
         #[arg(long, help = "输出文件路径")]
         output: Option<PathBuf>,
+
+        #[arg(long, help = "字段路径glob过滤模式 (如 *.width, PNGFile.ihdr.*)")]
+        filter: Option<String>,
+
+        #[arg(long, help = "输出解析统计摘要到stderr")]
+        stats: bool,
     },
     #[command(about = "差异对比两个二进制文件")]
     Diff {
@@ -65,7 +71,7 @@ pub enum Commands {
         #[arg(help = "第二个文件路径")]
         file2: PathBuf,
 
-        #[arg(short, long, help = "YAML格式定义文件路径")]
+        #[arg(short = 'F', long, help = "YAML格式定义文件路径")]
         format: Option<PathBuf>,
 
         #[arg(short = 't', long, help = "使用内置格式")]
@@ -76,6 +82,14 @@ pub enum Commands {
 
         #[arg(long, help = "输出文件路径")]
         output: Option<PathBuf>,
+
+        #[arg(long, help = "字段路径glob过滤模式")]
+        filter: Option<String>,
+    },
+    #[command(about = "验证YAML格式定义文件的正确性")]
+    Validate {
+        #[arg(help = "YAML格式定义文件路径")]
+        format: PathBuf,
     },
     #[command(about = "列出内置格式")]
     ListFormats,
@@ -103,6 +117,7 @@ pub enum ExitCode {
     ChecksumFailure = 1,
     FormatError = 2,
     NoMatch = 3,
+    ValidationError = 4,
 }
 
 impl From<ExitCode> for i32 {

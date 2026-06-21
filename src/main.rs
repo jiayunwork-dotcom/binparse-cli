@@ -7,7 +7,7 @@ use std::process;
 
 fn main() {
     let cli = Cli::parse();
-    
+
     let exit_code = match run(cli) {
         Ok(code) => code,
         Err(e) => {
@@ -15,53 +15,70 @@ fn main() {
             ExitCode::FormatError
         }
     };
-    
+
     process::exit(exit_code.into());
 }
 
 fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    match cli.command {
+    match &cli.command {
         Some(Commands::ListFormats) => {
             list_formats();
             return Ok(ExitCode::Success);
         }
         Some(Commands::ExportExample { format_name, output }) => {
-            return export_example(&format_name, output.as_deref());
+            return export_example(format_name, output.as_deref());
+        }
+        Some(Commands::Validate { format: format_path }) => {
+            return run_validate(format_path);
         }
         _ => {}
     }
 
-    let (file_path, diff_path, format_path, builtin_format, output_format, json_output, no_tui, output_path) = 
-        if let Some(Commands::Parse { file, format, builtin_format, output_format, json, no_tui, output }) = &cli.command {
-            (Some(file.clone()), None, format.clone(), builtin_format.clone(), output_format.clone(), *json, *no_tui, output.clone())
-        } else if let Some(Commands::Diff { file1, file2, format, builtin_format, output_format, output }) = &cli.command {
-            (Some(file1.clone()), Some(file2.clone()), format.clone(), builtin_format.clone(), output_format.clone(), false, true, output.clone())
-        } else {
-            (cli.file.clone(), cli.diff.clone(), cli.format.clone(), cli.builtin_format.clone(), cli.output_format.clone(), cli.json, cli.no_tui, cli.output.clone())
-        };
-
-    if let Some(diff_file) = diff_path {
-        let file1 = file_path.ok_or("请指定第一个文件路径")?;
-        return run_diff(&file1, &diff_file, format_path.as_deref(), builtin_format.as_deref(), output_format, output_path.as_deref());
+    if let Some(Commands::Parse {
+        file,
+        format,
+        builtin_format,
+        output_format,
+        json,
+        no_tui,
+        output,
+        filter,
+        stats,
+    }) = &cli.command
+    {
+        return run_parse(file, format.as_deref(), builtin_format.as_deref(), output_format.clone(), *json, *no_tui, output.as_deref(), filter.as_deref(), *stats);
     }
 
-    let file_path = file_path.ok_or("请指定二进制文件路径")?;
+    if let Some(Commands::Diff {
+        file1,
+        file2,
+        format,
+        builtin_format,
+        output_format,
+        output,
+        filter,
+    }) = &cli.command
+    {
+        return run_diff(file1, file2, format.as_deref(), builtin_format.as_deref(), output_format.clone(), output.as_deref(), filter.as_deref());
+    }
+
+    let diff_path = cli.diff.clone();
+    let format_path = cli.format.clone();
+    let builtin_format = cli.builtin_format.clone();
+    let output_format = cli.output_format.clone();
+    let json_output = cli.json;
+    let no_tui = cli.no_tui;
+    let output_path = cli.output.clone();
+
+    if let Some(diff_file) = diff_path {
+        let file1 = cli.file.ok_or("请指定第一个文件路径")?;
+        return run_diff(&file1, &diff_file, format_path.as_deref(), builtin_format.as_deref(), output_format, output_path.as_deref(), None);
+    }
+
+    let file_path = cli.file.ok_or("请指定二进制文件路径")?;
     let data = read_data(&file_path)?;
 
-    let format_def = if let Some(format_path) = format_path {
-        let yaml = fs::read_to_string(&format_path)?;
-        FormatDefinition::from_yaml(&yaml).map_err(|e| format!("格式定义错误: {}", e))?
-    } else if let Some(builtin) = builtin_format {
-        parse_builtin_format(&builtin).map_err(|e| format!("内置格式错误: {}", e))?
-    } else {
-        match detect_format(&data) {
-            Some(def) => def,
-            None => {
-                eprintln!("无法自动检测文件格式，请使用 --format 或 --builtin-format 指定格式定义");
-                return Ok(ExitCode::NoMatch);
-            }
-        }
-    };
+    let format_def = load_format_def(format_path.as_deref(), builtin_format.as_deref(), &data)?;
 
     let (parsed, has_checksum_failure) = parser::parse(&data, &format_def)?;
 
@@ -72,19 +89,63 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
     };
 
     if let Some(fmt) = output_format {
-        let output = match fmt {
-            OutputFormat::Json => export::to_json(&parsed),
-            OutputFormat::Csv => export::to_csv(&parsed)?,
-            OutputFormat::Md => export::to_markdown(&parsed, &format_def.name),
-            OutputFormat::Terminal => export::to_terminal_summary(&parsed, &format_def.name, atty::is(atty::Stream::Stdout)),
-        };
+        let output = format_output(&parsed, &format_def.name, fmt);
+        write_output(&output, output_path.as_deref())?;
+    } else if no_tui || !atty::is(atty::Stream::Stdout) {
+        let output = export::to_terminal_summary(&parsed, &format_def.name, false);
+        print!("{}", output);
+    } else {
+        println!("正在启动TUI界面... (按 q 退出)");
+        tui::run_tui(data, parsed, format_def.name.clone())?;
+    }
 
-        if let Some(output_path) = output_path {
-            fs::write(&output_path, &output)?;
-            println!("结果已写入: {}", output_path.display());
-        } else {
-            print!("{}", output);
+    Ok(if has_checksum_failure {
+        ExitCode::ChecksumFailure
+    } else {
+        ExitCode::Success
+    })
+}
+
+fn run_parse(
+    file: &Path,
+    format_path: Option<&Path>,
+    builtin_format: Option<&str>,
+    output_format: Option<OutputFormat>,
+    json_output: bool,
+    no_tui: bool,
+    output_path: Option<&Path>,
+    filter_pattern: Option<&str>,
+    show_stats: bool,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let data = read_data(file)?;
+    let format_def = load_format_def(format_path, builtin_format, &data)?;
+
+    let (parsed, has_checksum_failure) = parser::parse(&data, &format_def)?;
+
+    let parsed = if let Some(pattern) = filter_pattern {
+        if !filter::has_matching_fields(&parsed, pattern) {
+            println!("无匹配字段");
+            return Ok(ExitCode::Success);
         }
+        filter::filter_parsed_field(&parsed, pattern).unwrap_or(parsed)
+    } else {
+        parsed
+    };
+
+    if show_stats {
+        let stats = stats::ParseStats::from_parsed_field(&parsed, data.len());
+        eprintln!("{}", stats.format_to_stderr());
+    }
+
+    let output_format = if json_output {
+        Some(OutputFormat::Json)
+    } else {
+        output_format
+    };
+
+    if let Some(fmt) = output_format {
+        let output = format_output(&parsed, &format_def.name, fmt);
+        write_output(&output, output_path)?;
     } else if no_tui || !atty::is(atty::Stream::Stdout) {
         let output = export::to_terminal_summary(&parsed, &format_def.name, false);
         print!("{}", output);
@@ -107,6 +168,7 @@ fn run_diff(
     builtin_format: Option<&str>,
     output_format: Option<OutputFormat>,
     output_path: Option<&Path>,
+    filter_pattern: Option<&str>,
 ) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let data1 = read_data(file1)?;
     let data2 = read_data(file2)?;
@@ -128,6 +190,25 @@ fn run_diff(
 
     let (parsed1, _) = parser::parse(&data1, &format_def)?;
     let (parsed2, _) = parser::parse(&data2, &format_def)?;
+
+    let parsed1 = if let Some(pattern) = filter_pattern {
+        if !filter::has_matching_fields(&parsed1, pattern) {
+            println!("无匹配字段");
+            return Ok(ExitCode::Success);
+        }
+        filter::filter_parsed_field(&parsed1, pattern).unwrap_or(parsed1)
+    } else {
+        parsed1
+    };
+    let parsed2 = if let Some(pattern) = filter_pattern {
+        if !filter::has_matching_fields(&parsed2, pattern) {
+            println!("无匹配字段");
+            return Ok(ExitCode::Success);
+        }
+        filter::filter_parsed_field(&parsed2, pattern).unwrap_or(parsed2)
+    } else {
+        parsed2
+    };
 
     let diff_result = diff::diff(&parsed1, &parsed2);
 
@@ -152,7 +233,7 @@ fn run_diff(
             md.push_str(&format!("| 总字段数 | {} |\n", diff_result.total_fields));
             md.push_str(&format!("| 差异字段数 | {} |\n", diff_result.different_fields));
             md.push_str(&format!("| 差异率 | {:.2}% |\n\n", diff_result.diff_rate * 100.0));
-            
+
             if diff_result.different_fields > 0 {
                 md.push_str("## 差异详情\n\n");
                 md.push_str("| 字段路径 | 偏移 | 长度 | 文件1值 | 文件2值 | 状态 |\n");
@@ -162,7 +243,7 @@ fn run_diff(
                 md.push_str("## 结果\n\n");
                 md.push_str("两个文件完全相同，没有发现差异。\n");
             }
-            
+
             md
         }
     };
@@ -180,6 +261,71 @@ fn run_diff(
     println!("差异率: {:.2}%", diff_result.diff_rate * 100.0);
 
     Ok(ExitCode::Success)
+}
+
+fn run_validate(format_path: &Path) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let yaml = fs::read_to_string(format_path)
+        .map_err(|e| format!("无法读取格式定义文件: {}", e))?;
+
+    let def = match FormatDefinition::from_yaml_unvalidated(&yaml) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("格式定义错误: {}", e);
+            return Ok(ExitCode::FormatError);
+        }
+    };
+
+    let errors = validate::validate_format_definition(&def);
+
+    if errors.is_empty() {
+        println!("格式定义有效");
+        Ok(ExitCode::Success)
+    } else {
+        for err in &errors {
+            eprintln!("错误 [{}]: {}", err.location, err.reason);
+        }
+        Ok(ExitCode::FormatError)
+    }
+}
+
+fn load_format_def(
+    format_path: Option<&Path>,
+    builtin_format: Option<&str>,
+    data: &[u8],
+) -> Result<FormatDefinition, Box<dyn std::error::Error>> {
+    if let Some(fp) = format_path {
+        let yaml = fs::read_to_string(fp)?;
+        Ok(FormatDefinition::from_yaml(&yaml).map_err(|e| format!("格式定义错误: {}", e))?)
+    } else if let Some(builtin) = builtin_format {
+        Ok(parse_builtin_format(builtin).map_err(|e| format!("内置格式错误: {}", e))?)
+    } else {
+        match detect_format(data) {
+            Some(def) => Ok(def),
+            None => {
+                eprintln!("无法自动检测文件格式，请使用 --format 或 --builtin-format 指定格式定义");
+                Err("无法自动检测文件格式".into())
+            }
+        }
+    }
+}
+
+fn format_output(parsed: &parser::ParsedField, format_name: &str, fmt: OutputFormat) -> String {
+    match fmt {
+        OutputFormat::Json => export::to_json(parsed),
+        OutputFormat::Csv => export::to_csv(parsed).unwrap_or_default(),
+        OutputFormat::Md => export::to_markdown(parsed, format_name),
+        OutputFormat::Terminal => export::to_terminal_summary(parsed, format_name, atty::is(atty::Stream::Stdout)),
+    }
+}
+
+fn write_output(output: &str, output_path: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(path) = output_path {
+        fs::write(path, output)?;
+        println!("结果已写入: {}", path.display());
+    } else {
+        print!("{}", output);
+    }
+    Ok(())
 }
 
 fn write_diff_csv_rows(
@@ -215,7 +361,7 @@ fn write_diff_markdown_rows(fields: &[diff::DiffField], md: &mut String) {
             } else {
                 "不同"
             };
-            
+
             md.push_str(&format!(
                 "| {} | 0x{:08X} | {} | `{}` | `{}` | {} |\n",
                 field.path,
@@ -253,13 +399,13 @@ fn list_formats() {
 fn export_example(format_name: &str, output: Option<&Path>) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let yaml = get_builtin_format(format_name)
         .ok_or_else(|| format!("未知的内置格式: {}", format_name))?;
-    
+
     if let Some(output_path) = output {
         fs::write(output_path, yaml)?;
         println!("格式定义已导出到: {}", output_path.display());
     } else {
         print!("{}", yaml);
     }
-    
+
     Ok(ExitCode::Success)
 }
