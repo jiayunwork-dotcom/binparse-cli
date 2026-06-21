@@ -78,3 +78,8 @@ htmlcov/
 *.bak
 *.tmp
 .cache/
+
+
+# Added by cargo
+
+/target
