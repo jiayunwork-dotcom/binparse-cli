@@ -140,6 +140,15 @@ pub enum Commands {
 
         #[arg(long, help = "包含调试信息（字段在YAML中的行号）")]
         debug: bool,
+
+        #[arg(long, help = "目标格式版本号，默认为当前最新版本")]
+        target_version: Option<u16>,
+
+        #[arg(long, help = "启用编译缓存，未变更时跳过编译")]
+        cache: bool,
+
+        #[arg(long, help = "优化字符串表，按引用频次降序排列")]
+        optimize: bool,
     },
     #[command(about = "反编译.bfmt二进制文件为YAML格式定义")]
     Decompile {
@@ -148,6 +157,14 @@ pub enum Commands {
 
         #[arg(short, long, help = "输出文件路径，默认输出到stdout")]
         output: Option<PathBuf>,
+    },
+    #[command(about = "对比两个格式定义文件的结构差异（支持.yaml和.bfmt）")]
+    DiffFormat {
+        #[arg(help = "第一个格式定义文件路径 (.yaml/.bfmt)")]
+        file1: PathBuf,
+
+        #[arg(help = "第二个格式定义文件路径 (.yaml/.bfmt)")]
+        file2: PathBuf,
     },
 }
 

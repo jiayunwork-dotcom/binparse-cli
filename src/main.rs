@@ -1,9 +1,13 @@
 use binparse_cli::*;
 use clap::Parser;
+use sha2::{Sha256, Digest};
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn main() {
     let cli = Cli::parse();
@@ -44,11 +48,14 @@ fn run(cli: Cli) -> Result<i32, Box<dyn std::error::Error>> {
         }) => {
             return run_patch_cmd(input, output, format.as_deref(), builtin_format.as_deref(), sets, patch_file.as_deref(), vars, *dry_run, *undo);
         }
-        Some(Commands::Compile { input, output, debug }) => {
-            return Ok(run_compile(input, output, *debug)? as i32);
+        Some(Commands::Compile { input, output, debug, target_version, cache, optimize }) => {
+            return Ok(run_compile(input, output, *debug, target_version.unwrap_or(0), *cache, *optimize)? as i32);
         }
         Some(Commands::Decompile { input, output }) => {
             return Ok(run_decompile(input, output.as_deref())? as i32);
+        }
+        Some(Commands::DiffFormat { file1, file2 }) => {
+            return Ok(run_diff_format(file1, file2)? as i32);
         }
         _ => {}
     }
@@ -273,7 +280,24 @@ fn run_validate(format_path: &Path) -> Result<ExitCode, Box<dyn std::error::Erro
     let def = if let Some(ext) = format_path.extension().and_then(|e| e.to_str()) {
         if ext == "bfmt" {
             let mut file = fs::File::open(format_path)?;
-            match load_from_bfmt(&mut file) {
+            match read_bfmt_version(&mut file) {
+                Ok(version) => {
+                    if version > VERSION {
+                        println!("版本兼容性: 不兼容 (文件版本={}, 支持的最大版本={})", version, VERSION);
+                        return Ok(ExitCode::FormatError);
+                    } else if version < VERSION {
+                        println!("版本兼容性: 向前兼容 (文件版本={}, 当前版本={}, 建议重新编译)", version, VERSION);
+                    } else {
+                        println!("版本兼容性: 兼容 (文件版本={}, 当前版本={})", version, VERSION);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("读取.bfmt版本失败: {}", e);
+                    return Ok(ExitCode::FormatError);
+                }
+            }
+            let mut file2 = fs::File::open(format_path)?;
+            match load_from_bfmt(&mut file2) {
                 Ok(d) => d,
                 Err(e) => {
                     eprintln!("二进制格式定义加载错误: {}", e);
@@ -348,15 +372,34 @@ fn run_compile(
     input: &Path,
     output: &Path,
     include_debug: bool,
+    target_version: u16,
+    use_cache: bool,
+    optimize: bool,
 ) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    let yaml = match fs::read_to_string(input) {
+    let yaml_content = match fs::read_to_string(input) {
         Ok(y) => y,
         Err(e) => {
             eprintln!("读取输入文件失败: {}", e);
             return Ok(ExitCode::FormatError);
         }
     };
-    let def = match FormatDefinition::from_yaml(&yaml) {
+
+    let source_sha256 = compute_sha256(&yaml_content.as_bytes());
+
+    if use_cache {
+        let meta_path = get_meta_path(output);
+        if meta_path.exists() {
+            if let Ok(meta) = read_meta(&meta_path) {
+                if meta.source_sha256 == source_sha256 &&
+                   meta.source_path == input.to_string_lossy().to_string() {
+                    println!("源文件未变更,跳过编译");
+                    return Ok(ExitCode::Success);
+                }
+            }
+        }
+    }
+
+    let def = match FormatDefinition::from_yaml(&yaml_content) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("YAML解析错误: {}", e);
@@ -364,16 +407,35 @@ fn run_compile(
         }
     };
     let mut file = fs::File::create(output)?;
-    let size = compile_to_bfmt(&def, &mut file, include_debug)?;
+    let size = compile_to_bfmt(&def, &mut file, include_debug, target_version, optimize)?;
+
+    if use_cache {
+        let meta_path = get_meta_path(output);
+        let meta = BfmtMeta {
+            source_path: input.to_string_lossy().to_string(),
+            source_sha256: source_sha256.clone(),
+            compile_timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+            output_size: size as u64,
+        };
+        if let Err(e) = write_meta(&meta_path, &meta) {
+            eprintln!("警告: 无法写入元数据文件: {}", e);
+        }
+    }
+
     let struct_count = def.structs.len() + 1;
     let enum_count = def.enums.len();
     let field_count = count_fields(&def);
+    let display_version = if target_version == 0 { VERSION } else { target_version };
     println!("编译成功!");
     println!("  输出文件: {}", output.display());
     println!("  文件大小: {} 字节", size);
+    println!("  格式版本: {}", display_version);
     println!("  结构体: {} 个", struct_count);
     println!("  枚举: {} 个", enum_count);
     println!("  字段: {} 个", field_count);
+    if optimize {
+        println!("  字符串表: 已优化");
+    }
     Ok(ExitCode::Success)
 }
 
@@ -642,4 +704,226 @@ fn run_patch_cmd(
     }
 
     Ok(exit_code)
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BfmtMeta {
+    source_path: String,
+    source_sha256: String,
+    compile_timestamp: u64,
+    output_size: u64,
+}
+
+fn compute_sha256(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    let result = hasher.finalize();
+    format!("{:x}", result)
+}
+
+fn get_meta_path(output: &Path) -> PathBuf {
+    let mut meta_path = output.to_path_buf();
+    let file_name = meta_path.file_name().unwrap().to_string_lossy().to_string();
+    meta_path.set_file_name(format!("{}.meta", file_name));
+    meta_path
+}
+
+fn read_meta(path: &Path) -> Result<BfmtMeta, Box<dyn std::error::Error>> {
+    let content = fs::read_to_string(path)?;
+    let meta: BfmtMeta = toml::from_str(&content)?;
+    Ok(meta)
+}
+
+fn write_meta(path: &Path, meta: &BfmtMeta) -> Result<(), Box<dyn std::error::Error>> {
+    let toml_str = toml::to_string(meta)?;
+    fs::write(path, toml_str)?;
+    Ok(())
+}
+
+fn load_format_from_file(path: &Path) -> Result<FormatDefinition, Box<dyn std::error::Error>> {
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        if ext == "bfmt" {
+            let mut file = fs::File::open(path)?;
+            return Ok(load_from_bfmt(&mut file)
+                .map_err(|e| format!("二进制格式定义加载错误: {}", e))?);
+        }
+    }
+    let yaml = fs::read_to_string(path)
+        .map_err(|e| format!("无法读取格式定义文件: {}", e))?;
+    Ok(FormatDefinition::from_yaml(&yaml).map_err(|e| format!("格式定义错误: {}", e))?)
+}
+
+fn run_diff_format(
+    file1: &Path,
+    file2: &Path,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let def1 = load_format_from_file(file1)?;
+    let def2 = load_format_from_file(file2)?;
+
+    let changes = diff_format_definitions(&def1, &def2);
+
+    if changes.is_empty() {
+        println!("格式定义一致,无差异");
+        return Ok(ExitCode::Success);
+    }
+
+    for line in &changes {
+        println!("{}", line);
+    }
+
+    Ok(ExitCode::FormatError)
+}
+
+fn diff_format_definitions(def1: &FormatDefinition, def2: &FormatDefinition) -> Vec<String> {
+    let mut changes = Vec::new();
+
+    if def1.name != def2.name {
+        changes.push(format!("~ 格式名称: \"{}\" -> \"{}\"", def1.name, def2.name));
+    }
+    if def1.magic != def2.magic {
+        changes.push(format!("~ 魔数: {:?} -> {:?}", def1.magic, def2.magic));
+    }
+
+    diff_enums(&def1.enums, &def2.enums, &mut changes);
+    diff_structs(&def1.structs, &def2.structs, &mut changes);
+
+    let structs1_with_root: Vec<&StructDefinition> = def1.structs.iter().chain(std::iter::once(&def1.root)).collect();
+    let structs2_with_root: Vec<&StructDefinition> = def2.structs.iter().chain(std::iter::once(&def2.root)).collect();
+
+    let structs1_map: HashMap<&str, &StructDefinition> = structs1_with_root.iter().map(|s| (s.name.as_str(), *s)).collect();
+    let structs2_map: HashMap<&str, &StructDefinition> = structs2_with_root.iter().map(|s| (s.name.as_str(), *s)).collect();
+
+    let all_names: HashSet<&str> = structs1_map.keys().chain(structs2_map.keys()).copied().collect();
+
+    for name in &all_names {
+        match (structs1_map.get(name), structs2_map.get(name)) {
+            (Some(s1), Some(s2)) => {
+                diff_struct_fields(s1, s2, &mut changes);
+            }
+            _ => {}
+        }
+    }
+
+    changes
+}
+
+fn diff_enums(enums1: &[EnumDefinition], enums2: &[EnumDefinition], changes: &mut Vec<String>) {
+    let map1: HashMap<&str, &EnumDefinition> = enums1.iter().map(|e| (e.name.as_str(), e)).collect();
+    let map2: HashMap<&str, &EnumDefinition> = enums2.iter().map(|e| (e.name.as_str(), e)).collect();
+
+    let all_names: HashSet<&str> = map1.keys().chain(map2.keys()).copied().collect();
+
+    for name in &all_names {
+        match (map1.get(name), map2.get(name)) {
+            (None, Some(_)) => {
+                changes.push(format!("+ 新增枚举: {}", name));
+            }
+            (Some(_), None) => {
+                changes.push(format!("- 删除枚举: {}", name));
+            }
+            (Some(e1), Some(e2)) => {
+                diff_enum_values(e1, e2, changes);
+            }
+            (None, None) => {}
+        }
+    }
+}
+
+fn diff_enum_values(e1: &EnumDefinition, e2: &EnumDefinition, changes: &mut Vec<String>) {
+    let keys1: HashSet<&str> = e1.values.keys().map(|s| s.as_str()).collect();
+    let keys2: HashSet<&str> = e2.values.keys().map(|s| s.as_str()).collect();
+
+    for k in keys1.difference(&keys2) {
+        changes.push(format!("- 枚举值 {}.{}: {}", e1.name, k, e1.values.get(*k).unwrap()));
+    }
+    for k in keys2.difference(&keys1) {
+        changes.push(format!("+ 枚举值 {}.{}: {}", e2.name, k, e2.values.get(*k).unwrap()));
+    }
+    for k in keys1.intersection(&keys2) {
+        let v1 = e1.values.get(*k).unwrap();
+        let v2 = e2.values.get(*k).unwrap();
+        if v1 != v2 {
+            changes.push(format!("~ 枚举值 {}.{}: {} -> {}", e1.name, k, v1, v2));
+        }
+    }
+}
+
+fn diff_structs(structs1: &[StructDefinition], structs2: &[StructDefinition], changes: &mut Vec<String>) {
+    let map1: HashMap<&str, &StructDefinition> = structs1.iter().map(|s| (s.name.as_str(), s)).collect();
+    let map2: HashMap<&str, &StructDefinition> = structs2.iter().map(|s| (s.name.as_str(), s)).collect();
+
+    let all_names: HashSet<&str> = map1.keys().chain(map2.keys()).copied().collect();
+
+    for name in &all_names {
+        match (map1.get(name), map2.get(name)) {
+            (None, Some(_)) => {
+                changes.push(format!("+ 新增结构体: {}", name));
+            }
+            (Some(_), None) => {
+                changes.push(format!("- 删除结构体: {}", name));
+            }
+            _ => {}
+        }
+    }
+}
+
+fn diff_struct_fields(s1: &StructDefinition, s2: &StructDefinition, changes: &mut Vec<String>) {
+    let fields1: HashMap<&str, &Field> = s1.fields.iter().map(|f| (f.name.as_str(), f)).collect();
+    let fields2: HashMap<&str, &Field> = s2.fields.iter().map(|f| (f.name.as_str(), f)).collect();
+
+    let all_names: HashSet<&str> = fields1.keys().chain(fields2.keys()).copied().collect();
+
+    for name in &all_names {
+        match (fields1.get(name), fields2.get(name)) {
+            (None, Some(_)) => {
+                changes.push(format!("+ 新增字段 {}.{}", s1.name, name));
+            }
+            (Some(_), None) => {
+                changes.push(format!("- 删除字段 {}.{}", s1.name, name));
+            }
+            (Some(f1), Some(f2)) => {
+                diff_field_details(s1.name.as_str(), name, f1, f2, changes);
+            }
+            (None, None) => {}
+        }
+    }
+}
+
+fn diff_field_details(struct_name: &str, field_name: &str, f1: &Field, f2: &Field, changes: &mut Vec<String>) {
+    let mut field_changes = Vec::new();
+
+    if format_data_type(&f1.data_type) != format_data_type(&f2.data_type) {
+        field_changes.push(format!("类型: {} -> {}", format_data_type(&f1.data_type), format_data_type(&f2.data_type)));
+    }
+    if f1.endian != f2.endian {
+        field_changes.push(format!("字节序: {:?} -> {:?}", f1.endian, f2.endian));
+    }
+    if f1.display_format != f2.display_format {
+        field_changes.push(format!("显示格式: {:?} -> {:?}", f1.display_format, f2.display_format));
+    }
+
+    if !field_changes.is_empty() {
+        changes.push(format!("~ 修改字段 {}.{} ({})", struct_name, field_name, field_changes.join(", ")));
+    }
+}
+
+fn format_data_type(dt: &DataType) -> String {
+    match dt {
+        DataType::U8 => "u8".to_string(),
+        DataType::U16 => "u16".to_string(),
+        DataType::U32 => "u32".to_string(),
+        DataType::U64 => "u64".to_string(),
+        DataType::I8 => "i8".to_string(),
+        DataType::I16 => "i16".to_string(),
+        DataType::I32 => "i32".to_string(),
+        DataType::I64 => "i64".to_string(),
+        DataType::F32 => "f32".to_string(),
+        DataType::F64 => "f64".to_string(),
+        DataType::Bytes { length } => format!("bytes(length={})", length),
+        DataType::String { length, encoding } => format!("string(length={}, encoding={:?})", length, encoding),
+        DataType::BitField { bit_start, bit_length } => format!("bit_field(start={}, length={})", bit_start, bit_length),
+        DataType::Struct { name } => format!("struct({})", name),
+        DataType::Array { element_type, length } => format!("array({}, length={})", format_data_type(element_type), length),
+        DataType::Enum { name, underlying } => format!("enum({}, underlying={})", name, format_data_type(underlying)),
+    }
 }

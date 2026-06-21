@@ -55,6 +55,11 @@ pub enum BfmtError {
         expected: u16,
         got: u16,
     },
+    #[error("File version {file_version} is higher than maximum supported version {max_supported}")]
+    VersionTooHigh {
+        file_version: u16,
+        max_supported: u16,
+    },
     #[error("Unexpected EOF at offset 0x{offset:08X}: needed {needed} bytes, only {available} available")]
     UnexpectedEof {
         offset: usize,
@@ -111,6 +116,7 @@ pub enum BfmtError {
 struct StringTable {
     strings: Vec<String>,
     index_map: HashMap<String, u32>,
+    ref_counts: HashMap<String, u32>,
 }
 
 impl StringTable {
@@ -118,10 +124,12 @@ impl StringTable {
         StringTable {
             strings: Vec::new(),
             index_map: HashMap::new(),
+            ref_counts: HashMap::new(),
         }
     }
 
     fn insert(&mut self, s: &str) -> u32 {
+        *self.ref_counts.entry(s.to_string()).or_insert(0) += 1;
         if let Some(&idx) = self.index_map.get(s) {
             return idx;
         }
@@ -140,6 +148,18 @@ impl StringTable {
                 index,
                 table_size: self.strings.len(),
             })
+    }
+
+    fn optimize_by_frequency(&mut self) {
+        let mut pairs: Vec<(String, u32)> = self.ref_counts.clone().into_iter().collect();
+        pairs.sort_by(|a, b| b.1.cmp(&a.1));
+        self.strings.clear();
+        self.index_map.clear();
+        for (s, _) in &pairs {
+            let idx = self.strings.len() as u32;
+            self.strings.push(s.clone());
+            self.index_map.insert(s.clone(), idx);
+        }
     }
 
 
@@ -546,12 +566,18 @@ pub fn compile_to_bfmt<W: Write>(
     def: &FormatDefinition,
     writer: &mut W,
     include_debug: bool,
+    target_version: u16,
+    optimize: bool,
 ) -> Result<usize, BfmtError> {
-    let table = build_string_table(def);
+    let mut table = build_string_table(def);
+    if optimize {
+        table.optimize_by_frequency();
+    }
+    let version = if target_version == 0 { VERSION } else { target_version };
     let mut offset = 0usize;
     writer.write_all(&MAGIC)?;
     offset += 4;
-    writer.write_all(&VERSION.to_le_bytes())?;
+    writer.write_all(&version.to_le_bytes())?;
     offset += 2;
     let flags = if include_debug { FLAG_DEBUG } else { 0 };
     writer.write_all(&flags.to_le_bytes())?;
@@ -824,12 +850,14 @@ pub fn load_from_bfmt<R: Read>(reader: &mut R) -> Result<FormatDefinition, BfmtE
     let mut version_buf = [0u8; 2];
     read_exact(reader, &mut version_buf, &mut offset)?;
     let version = u16::from_le_bytes(version_buf);
-    if version != VERSION {
-        return Err(BfmtError::InvalidVersion {
-            offset: 4,
-            expected: VERSION,
-            got: version,
+    if version > VERSION {
+        return Err(BfmtError::VersionTooHigh {
+            file_version: version,
+            max_supported: VERSION,
         });
+    }
+    if version < VERSION {
+        eprintln!("警告: 格式定义文件版本为{},当前支持版本为{},建议重新编译", version, VERSION);
     }
     let mut flags_buf = [0u8; 2];
     read_exact(reader, &mut flags_buf, &mut offset)?;
@@ -886,6 +914,22 @@ pub fn load_from_bfmt<R: Read>(reader: &mut R) -> Result<FormatDefinition, BfmtE
 
 pub fn decompile_to_yaml(def: &FormatDefinition) -> Result<String, BfmtError> {
     Ok(serde_yaml::to_string(def)?)
+}
+
+pub fn read_bfmt_version<R: Read>(reader: &mut R) -> Result<u16, BfmtError> {
+    let mut offset = 0usize;
+    let mut magic_buf = [0u8; 4];
+    read_exact(reader, &mut magic_buf, &mut offset)?;
+    if magic_buf != MAGIC {
+        return Err(BfmtError::InvalidMagic {
+            offset: 0,
+            expected: MAGIC,
+            got: magic_buf,
+        });
+    }
+    let mut version_buf = [0u8; 2];
+    read_exact(reader, &mut version_buf, &mut offset)?;
+    Ok(u16::from_le_bytes(version_buf))
 }
 
 pub fn count_fields(def: &FormatDefinition) -> usize {
@@ -965,7 +1009,7 @@ root:
     fn test_roundtrip_compile_decompile() {
         let def = create_test_format();
         let mut buf = Vec::new();
-        let size = compile_to_bfmt(&def, &mut buf, false).unwrap();
+        let size = compile_to_bfmt(&def, &mut buf, false, 0, false).unwrap();
         assert!(size > 0);
         assert_eq!(buf.len(), size);
         let def2 = load_from_bfmt(&mut buf.as_slice()).unwrap();
@@ -1003,16 +1047,17 @@ root:
         data.extend_from_slice(&0u32.to_le_bytes());
         let result = load_from_bfmt(&mut data.as_slice());
         assert!(result.is_err());
-        assert!(format!("{}", result.err().unwrap()).contains("Invalid version"));
+        let err_msg = format!("{}", result.err().unwrap());
+        assert!(err_msg.contains("higher than maximum supported") || err_msg.contains("VersionTooHigh"));
     }
 
     #[test]
     fn test_debug_flag() {
         let def = create_test_format();
         let mut buf_debug = Vec::new();
-        let size_debug = compile_to_bfmt(&def, &mut buf_debug, true).unwrap();
+        let size_debug = compile_to_bfmt(&def, &mut buf_debug, true, 0, false).unwrap();
         let mut buf_normal = Vec::new();
-        let size_normal = compile_to_bfmt(&def, &mut buf_normal, false).unwrap();
+        let size_normal = compile_to_bfmt(&def, &mut buf_normal, false, 0, false).unwrap();
         assert!(size_debug > size_normal);
         let field_count = count_fields(&def);
         assert_eq!(size_debug - size_normal, field_count * 4);
@@ -1022,7 +1067,7 @@ root:
     fn test_relative_offset_encodes_as_invalid_index() {
         let def = create_test_format();
         let mut buf = Vec::new();
-        compile_to_bfmt(&def, &mut buf, false).unwrap();
+        compile_to_bfmt(&def, &mut buf, false, 0, false).unwrap();
         let relative_fields: Vec<_> = def.root.fields.iter()
             .filter(|f| f.offset.as_deref() == Some("relative"))
             .collect();
