@@ -207,7 +207,6 @@ fn merge_inheritance_chain(chain: &[TemplateDefinition]) -> TemplateDefinition {
         if let Some(pos) = merged_root_fields.iter().position(|f| f.name == *target_name) {
             let mut replacement = (*field).clone();
             replacement.override_field = None;
-            replacement.name = target_name.clone();
             merged_root_fields[pos] = replacement;
         }
     }
@@ -1510,7 +1509,7 @@ root:
 
         assert_eq!(merged.root.fields.len(), 2);
         assert_eq!(merged.root.fields[0].name, "magic");
-        assert_eq!(merged.root.fields[1].name, "checksum");
+        assert_eq!(merged.root.fields[1].name, "overridden_checksum");
         assert_eq!(merged.root.fields[1].override_field, None);
         match &merged.root.fields[1].data_type {
             serde_yaml::Value::String(s) => assert_eq!(s, "u64"),
