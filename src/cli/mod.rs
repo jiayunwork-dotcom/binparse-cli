@@ -115,14 +115,20 @@ pub enum Commands {
         #[arg(short = 't', long, help = "使用内置格式 (png/bmp/wav/zip/elf/pe)")]
         builtin_format: Option<String>,
 
-        #[arg(long = "set", help = "设置字段值，格式为\"字段路径=新值\"，可多次指定")]
+        #[arg(long = "set", help = "设置字段值，格式为\"字段路径=新值[@条件表达式]\"，可多次指定")]
         sets: Vec<String>,
 
-        #[arg(long = "patch-file", help = "批量修改脚本文件路径，每行一条\"字段路径=新值\"指令")]
+        #[arg(long = "patch-file", help = "批量修改脚本文件路径，每行一条\"字段路径=新值[@条件表达式]\"指令，支持${变量名}模板占位符")]
         patch_file: Option<PathBuf>,
+
+        #[arg(long = "var", help = "模板变量值，格式为\"name=value\"，用于替换patch文件中的${变量名}")]
+        vars: Vec<String>,
 
         #[arg(long, help = "试运行模式，不实际写文件，只输出修改计划")]
         dry_run: bool,
+
+        #[arg(long, help = "撤销最近一次patch操作，从.binpatch_history文件恢复")]
+        undo: bool,
     },
 }
 

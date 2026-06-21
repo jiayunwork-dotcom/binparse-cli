@@ -12,6 +12,27 @@ use std::path::Path;
 pub struct PatchInstruction {
     pub field_path: String,
     pub new_value_str: String,
+    pub condition: Option<String>,
+    pub condition_satisfied: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct SkippedInstruction {
+    pub field_path: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct OffsetWarning {
+    pub dependent_field: String,
+    pub modified_field: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct HistoryEntry {
+    pub offset: usize,
+    pub length: usize,
+    pub original_hex: String,
 }
 
 #[derive(Debug, Clone)]
@@ -40,6 +61,8 @@ pub struct PatchResult {
     pub changes: Vec<FieldChange>,
     pub checksum_recalcs: Vec<ChecksumRecalc>,
     pub validation_failures: Vec<(String, String, String)>,
+    pub skipped: Vec<SkippedInstruction>,
+    pub offset_warnings: Vec<OffsetWarning>,
 }
 
 pub struct PatchError;
@@ -50,10 +73,17 @@ impl PatchError {
     pub const VALUE_ENCODING_ERROR: i32 = 3;
     pub const VALIDATION_FAILURE: i32 = 1;
     pub const SUCCESS: i32 = 0;
+    pub const UNDEFINED_VARIABLE: i32 = 2;
 }
 
-pub fn parse_patch_instructions(sets: &[String], patch_file: Option<&Path>) -> Result<Vec<PatchInstruction>> {
-    let mut instructions: HashMap<String, String> = HashMap::new();
+pub fn parse_patch_instructions(
+    sets: &[String],
+    patch_file: Option<&Path>,
+    vars: &[String],
+) -> Result<Vec<PatchInstruction>> {
+    let var_map = parse_vars(vars)?;
+    let mut instructions: Vec<PatchInstruction> = Vec::new();
+    let mut seen_paths: HashMap<String, usize> = HashMap::new();
 
     if let Some(patch_file_path) = patch_file {
         let content = fs::read_to_string(patch_file_path)
@@ -63,24 +93,528 @@ pub fn parse_patch_instructions(sets: &[String], patch_file: Option<&Path>) -> R
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            if let Some((path, val)) = line.split_once('=') {
-                instructions.insert(path.trim().to_string(), val.trim().to_string());
+            let line = substitute_template_vars(line, &var_map)?;
+            if let Some(instr) = parse_instruction_line(&line)? {
+                if let Some(idx) = seen_paths.get(&instr.field_path) {
+                    instructions[*idx] = instr;
+                } else {
+                    seen_paths.insert(instr.field_path.clone(), instructions.len());
+                    instructions.push(instr);
+                }
             }
         }
     }
 
     for set in sets {
-        if let Some((path, val)) = set.split_once('=') {
-            instructions.insert(path.trim().to_string(), val.trim().to_string());
+        if let Some(instr) = parse_instruction_line(set)? {
+            if let Some(idx) = seen_paths.get(&instr.field_path) {
+                instructions[*idx] = instr;
+            } else {
+                seen_paths.insert(instr.field_path.clone(), instructions.len());
+                instructions.push(instr);
+            }
         } else {
-            return Err(anyhow!("无效的--set参数格式: {}，应为\"字段路径=新值\"", set));
+            return Err(anyhow!("无效的--set参数格式: {}，应为\"字段路径=新值[@条件表达式]\"", set));
         }
     }
 
-    Ok(instructions
-        .into_iter()
-        .map(|(field_path, new_value_str)| PatchInstruction { field_path, new_value_str })
-        .collect())
+    Ok(instructions)
+}
+
+fn parse_vars(vars: &[String]) -> Result<HashMap<String, String>> {
+    let mut var_map = HashMap::new();
+    for var in vars {
+        if let Some((name, val)) = var.split_once('=') {
+            var_map.insert(name.trim().to_string(), val.trim().to_string());
+        } else {
+            return Err(anyhow!("无效的--var参数格式: {}，应为\"name=value\"", var));
+        }
+    }
+    Ok(var_map)
+}
+
+fn substitute_template_vars(line: &str, vars: &HashMap<String, String>) -> Result<String> {
+    let mut result = line.to_string();
+    let re = regex::Regex::new(r"\$\{([a-zA-Z_][a-zA-Z0-9_]*)\}").unwrap();
+    for cap in re.captures_iter(line) {
+        let var_name = &cap[1];
+        if let Some(val) = vars.get(var_name) {
+            result = result.replace(&format!("${{{}}}", var_name), val);
+        } else {
+            return Err(anyhow!("未定义的模板变量: ${}", var_name));
+        }
+    }
+    Ok(result)
+}
+
+fn parse_instruction_line(line: &str) -> Result<Option<PatchInstruction>> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return Ok(None);
+    }
+
+    let (value_part, condition) = if let Some((val, cond)) = line.split_once('@') {
+        (val.trim(), Some(cond.trim().to_string()))
+    } else {
+        (line, None)
+    };
+
+    if let Some((path, val)) = value_part.split_once('=') {
+        Ok(Some(PatchInstruction {
+            field_path: path.trim().to_string(),
+            new_value_str: val.trim().to_string(),
+            condition,
+            condition_satisfied: true,
+        }))
+    } else {
+        Err(anyhow!("无效的指令格式: {}，应为\"字段路径=新值[@条件表达式]\"", line))
+    }
+}
+
+fn evaluate_condition(
+    condition: &str,
+    root: &ParsedField,
+    ctx: &HashMap<String, Value>,
+) -> Result<bool> {
+    let re = regex::Regex::new(r"^([a-zA-Z_][a-zA-Z0-9_\.\[\]]+)\s*(==|!=|>=|<=|>|<)\s*(-?\d+|0x[0-9a-fA-F]+)$").unwrap();
+    let caps = re.captures(condition)
+        .ok_or_else(|| anyhow!("无效的条件表达式格式: {}。应为\"字段路径 操作符 整数字面量\"，支持==、!=、>、<、>=、<=", condition))?;
+
+    let field_path = &caps[1];
+    let op = &caps[2];
+    let literal_str = &caps[3];
+
+    let field_value = if let Some(val) = ctx.get(field_path) {
+        if let Ok(int_val) = val.as_int() {
+            int_val
+        } else if let Ok(float_val) = val.as_float() {
+            float_val as i64
+        } else {
+            return Err(anyhow!("字段 {} 的值无法转换为整数", field_path));
+        }
+    } else if let Some(field) = find_field_by_path(root, field_path) {
+        field.value.to_i64()
+            .ok_or_else(|| anyhow!("字段 {} 的值无法转换为整数", field_path))?
+    } else {
+        return Err(anyhow!("条件表达式中引用的字段不存在: {}", field_path));
+    };
+
+    let literal_val = if let Some(hex) = literal_str.strip_prefix("0x").or_else(|| literal_str.strip_prefix("0X")) {
+        i64::from_str_radix(hex, 16).map_err(|e| anyhow!("十六进制解析失败: {}", e))?
+    } else {
+        literal_str.parse::<i64>().map_err(|e| anyhow!("整数解析失败: {}", e))?
+    };
+
+    let result = match op {
+        "==" => field_value == literal_val,
+        "!=" => field_value != literal_val,
+        ">" => field_value > literal_val,
+        "<" => field_value < literal_val,
+        ">=" => field_value >= literal_val,
+        "<=" => field_value <= literal_val,
+        _ => return Err(anyhow!("不支持的操作符: {}", op)),
+    };
+
+    Ok(result)
+}
+
+fn collect_offset_dependencies(format_def: &FormatDefinition) -> HashMap<String, Vec<String>> {
+    let mut deps: HashMap<String, Vec<String>> = HashMap::new();
+    let all_structs = collect_all_structs(format_def);
+
+    for struct_def in &all_structs {
+        collect_field_deps(struct_def, &format_def.root.name, "", format_def, &all_structs, &mut deps);
+    }
+
+    deps
+}
+
+fn collect_all_structs(format_def: &FormatDefinition) -> Vec<StructDefinition> {
+    let mut structs = format_def.structs.clone();
+    structs.push(format_def.root.clone());
+    structs
+}
+
+fn collect_field_deps(
+    struct_def: &StructDefinition,
+    struct_name: &str,
+    parent_path: &str,
+    format_def: &FormatDefinition,
+    all_structs: &[StructDefinition],
+    deps: &mut HashMap<String, Vec<String>>,
+) {
+    let current_path = if parent_path.is_empty() {
+        struct_name.to_string()
+    } else {
+        format!("{}.{}", parent_path, struct_name)
+    };
+
+    for field in &struct_def.fields {
+        let field_path = format!("{}.{}", current_path, field.name);
+        if let Some(offset_expr) = &field.offset {
+            if offset_expr != "relative" {
+                let referenced_fields = extract_field_references(offset_expr, format_def, all_structs, &current_path);
+                for ref_field in referenced_fields {
+                    deps.entry(ref_field)
+                        .or_insert_with(Vec::new)
+                        .push(field_path.clone());
+                }
+            }
+        }
+
+        match &field.data_type {
+            DataType::Struct { name } => {
+                if let Some(sd) = all_structs.iter().find(|s| s.name == *name) {
+                    collect_field_deps(sd, name, &current_path, format_def, all_structs, deps);
+                }
+            }
+            DataType::Array { element_type, .. } => {
+                if let DataType::Struct { name } = element_type.as_ref() {
+                    if let Some(sd) = all_structs.iter().find(|s| s.name == *name) {
+                        collect_field_deps(sd, name, &current_path, format_def, all_structs, deps);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn extract_field_references(
+    expr: &str,
+    format_def: &FormatDefinition,
+    all_structs: &[StructDefinition],
+    current_path: &str,
+) -> Vec<String> {
+    let mut references = Vec::new();
+    let re = regex::Regex::new(r"([a-zA-Z_][a-zA-Z0-9_]+)").unwrap();
+    for cap in re.captures_iter(expr) {
+        let ident = &cap[1];
+        if ident == "relative" {
+            continue;
+        }
+        if let Ok(_) = ident.parse::<i64>() {
+            continue;
+        }
+
+        let possible_paths = resolve_identifier(ident, current_path, format_def, all_structs);
+        for path in possible_paths {
+            if !references.contains(&path) {
+                references.push(path);
+            }
+        }
+    }
+    references
+}
+
+fn resolve_identifier(
+    ident: &str,
+    current_path: &str,
+    format_def: &FormatDefinition,
+    all_structs: &[StructDefinition],
+) -> Vec<String> {
+    let mut paths = Vec::new();
+
+    let mut path_parts: Vec<&str> = current_path.split('.').collect();
+    while !path_parts.is_empty() {
+        let candidate = format!("{}.{}", path_parts.join("."), ident);
+        if field_exists(&candidate, format_def, all_structs) {
+            paths.push(candidate);
+        }
+        path_parts.pop();
+    }
+
+    let root_candidate = format!("{}.{}", format_def.root.name, ident);
+    if field_exists(&root_candidate, format_def, all_structs) {
+        paths.push(root_candidate);
+    }
+
+    for struct_def in all_structs {
+        if struct_def.fields.iter().any(|f| f.name == ident) {
+            let candidate = format!("{}.{}", struct_def.name, ident);
+            if !paths.contains(&candidate) {
+                paths.push(candidate);
+            }
+        }
+    }
+
+    paths
+}
+
+fn field_exists(
+    path: &str,
+    format_def: &FormatDefinition,
+    all_structs: &[StructDefinition],
+) -> bool {
+    let parts: Vec<&str> = path.split('.').collect();
+    if parts.is_empty() {
+        return false;
+    }
+
+    let struct_name = parts[0];
+    let struct_def = if let Some(sd) = all_structs.iter().find(|s| s.name == struct_name) {
+        sd
+    } else {
+        return false;
+    };
+
+    check_field_in_struct(struct_def, &parts[1..], format_def, all_structs)
+}
+
+fn check_field_in_struct(
+    struct_def: &StructDefinition,
+    remaining_parts: &[&str],
+    format_def: &FormatDefinition,
+    all_structs: &[StructDefinition],
+) -> bool {
+    if remaining_parts.is_empty() {
+        return false;
+    }
+
+    let field_name = remaining_parts[0];
+    let field = match struct_def.fields.iter().find(|f| f.name == field_name) {
+        Some(f) => f,
+        None => return false,
+    };
+
+    if remaining_parts.len() == 1 {
+        return true;
+    }
+
+    match &field.data_type {
+        DataType::Struct { name } => {
+            if let Some(sd) = all_structs.iter().find(|s| s.name == *name) {
+                check_field_in_struct(sd, &remaining_parts[1..], format_def, all_structs)
+            } else {
+                false
+            }
+        }
+        DataType::Array { element_type, .. } => {
+            if let DataType::Struct { name } = element_type.as_ref() {
+                if let Some(sd) = all_structs.iter().find(|s| s.name == *name) {
+                    let mut rest = remaining_parts[1..].to_vec();
+                    if !rest.is_empty() {
+                        let re = regex::Regex::new(r"^\[\d+\]$").unwrap();
+                        if re.is_match(rest[0]) {
+                            rest = rest[1..].to_vec();
+                        }
+                    }
+                    check_field_in_struct(sd, &rest, format_def, all_structs)
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+fn check_offset_dependencies(
+    modified_fields: &[String],
+    format_def: &FormatDefinition,
+) -> Vec<OffsetWarning> {
+    let deps = collect_offset_dependencies(format_def);
+    let mut warnings = Vec::new();
+
+    for modified in modified_fields {
+        if let Some(dependents) = deps.get(modified) {
+            for dep in dependents {
+                warnings.push(OffsetWarning {
+                    dependent_field: dep.clone(),
+                    modified_field: modified.clone(),
+                });
+            }
+        }
+    }
+
+    warnings
+}
+
+pub fn read_patch_history(output_path: &Path) -> Result<Vec<Vec<HistoryEntry>>> {
+    let history_path = get_history_path(output_path);
+    if !history_path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let content = fs::read_to_string(&history_path)
+        .map_err(|e| anyhow!("无法读取历史文件: {}", e))?;
+
+    let mut batches = Vec::new();
+    let mut current_batch = Vec::new();
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            if !current_batch.is_empty() {
+                batches.push(current_batch);
+                current_batch = Vec::new();
+            }
+            continue;
+        }
+        if line.starts_with('#') {
+            continue;
+        }
+
+        let parts: Vec<&str> = line.split(':').collect();
+        if parts.len() == 3 {
+            let offset = parts[0].parse::<usize>()
+                .map_err(|e| anyhow!("历史文件格式错误 - 偏移解析失败: {}", e))?;
+            let length = parts[1].parse::<usize>()
+                .map_err(|e| anyhow!("历史文件格式错误 - 长度解析失败: {}", e))?;
+            let original_hex = parts[2].to_string();
+            current_batch.push(HistoryEntry { offset, length, original_hex });
+        } else {
+            return Err(anyhow!("历史文件格式错误: {}", line));
+        }
+    }
+
+    if !current_batch.is_empty() {
+        batches.push(current_batch);
+    }
+
+    Ok(batches)
+}
+
+pub fn write_patch_history(output_path: &Path, changes: &[FieldChange]) -> Result<()> {
+    let history_path = get_history_path(output_path);
+
+    let mut content = String::new();
+
+    if history_path.exists() {
+        let existing = fs::read_to_string(&history_path)
+            .map_err(|e| anyhow!("无法读取历史文件: {}", e))?;
+        if !existing.is_empty() && !existing.ends_with("\n\n") {
+            content.push_str(&existing);
+            if !existing.ends_with('\n') {
+                content.push('\n');
+            }
+            content.push('\n');
+        } else {
+            content.push_str(&existing);
+        }
+    }
+
+    for change in changes {
+        let hex_str = change.original_bytes.iter()
+            .map(|b| format!("{:02X}", b))
+            .collect::<Vec<_>>()
+            .join("");
+        content.push_str(&format!("{}:{}:{}\n", change.offset, change.length, hex_str));
+    }
+
+    fs::write(&history_path, content)
+        .map_err(|e| anyhow!("无法写入历史文件: {}", e))?;
+
+    Ok(())
+}
+
+pub fn remove_last_history_batch(output_path: &Path) -> Result<()> {
+    let history_path = get_history_path(output_path);
+    if !history_path.exists() {
+        return Ok(());
+    }
+
+    let content = fs::read_to_string(&history_path)
+        .map_err(|e| anyhow!("无法读取历史文件: {}", e))?;
+
+    let lines: Vec<&str> = content.lines().collect();
+    let mut last_non_empty = None;
+    let mut batch_start = None;
+
+    for i in (0..lines.len()).rev() {
+        let line = lines[i].trim();
+        if !line.is_empty() && !line.starts_with('#') {
+            if last_non_empty.is_none() {
+                last_non_empty = Some(i);
+            }
+            batch_start = Some(i);
+        } else if last_non_empty.is_some() {
+            break;
+        }
+    }
+
+    if batch_start.is_none() {
+        fs::remove_file(&history_path)
+            .map_err(|e| anyhow!("无法删除空的历史文件: {}", e))?;
+        return Ok(());
+    }
+
+    let batch_start = batch_start.unwrap();
+    let mut new_lines = lines[..batch_start].to_vec();
+
+    while !new_lines.is_empty() && new_lines.last().map_or(false, |l| l.trim().is_empty()) {
+        new_lines.pop();
+    }
+
+    let new_content = new_lines.join("\n");
+    if new_content.trim().is_empty() {
+        fs::remove_file(&history_path)
+            .map_err(|e| anyhow!("无法删除空的历史文件: {}", e))?;
+    } else {
+        fs::write(&history_path, new_content + "\n")
+            .map_err(|e| anyhow!("无法写入历史文件: {}", e))?;
+    }
+
+    Ok(())
+}
+
+fn get_history_path(output_path: &Path) -> std::path::PathBuf {
+    let parent = output_path.parent().unwrap_or_else(|| Path::new("."));
+    parent.join(".binpatch_history")
+}
+
+pub fn undo_last_patch(
+    output_path: &Path,
+    _format_def: &FormatDefinition,
+) -> Result<(Vec<FieldChange>, i32)> {
+    let batches = read_patch_history(output_path)?;
+    if batches.is_empty() {
+        return Err(anyhow!("没有找到可撤销的patch操作记录"));
+    }
+
+    let last_batch = batches.last().unwrap();
+    let mut data = fs::read(output_path)
+        .map_err(|e| anyhow!("无法读取输出文件: {}", e))?;
+
+    let mut changes = Vec::new();
+
+    for entry in last_batch {
+        let original_bytes = Vec::<u8>::from_hex(&entry.original_hex)
+            .map_err(|e| anyhow!("历史文件中原始字节解析失败: {}", e))?;
+
+        if entry.offset + entry.length > data.len() {
+            return Err(anyhow!("历史记录偏移超出文件范围: offset={}, length={}, file_size={}",
+                entry.offset, entry.length, data.len()));
+        }
+
+        let new_bytes = data[entry.offset..entry.offset + entry.length].to_vec();
+        let new_bytes_clone = new_bytes.clone();
+        data[entry.offset..entry.offset + entry.length].copy_from_slice(&original_bytes);
+
+        changes.push(FieldChange {
+            field_path: format!("<从历史恢复 @ 0x{:08X}>", entry.offset),
+            offset: entry.offset,
+            length: entry.length,
+            original_bytes: new_bytes,
+            new_bytes: original_bytes,
+            original_value_display: format!("[{}]", new_bytes_clone.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" ")),
+            new_value_display: format!("[{}]", entry.original_hex.chars()
+                .collect::<Vec<char>>()
+                .chunks(2)
+                .map(|c| c.iter().collect::<String>())
+                .collect::<Vec<_>>()
+                .join(" ")),
+        });
+    }
+
+    fs::write(output_path, &data)
+        .map_err(|e| anyhow!("写入撤销后的数据失败: {}", e))?;
+
+    remove_last_history_batch(output_path)?;
+
+    Ok((changes, PatchError::SUCCESS))
 }
 
 pub fn find_field_by_path<'a>(root: &'a ParsedField, path: &str) -> Option<&'a ParsedField> {
@@ -736,10 +1270,28 @@ pub fn run_patch(
     let ctx = build_value_context(&parsed);
 
     let mut changes: Vec<FieldChange> = Vec::new();
+    let mut skipped: Vec<SkippedInstruction> = Vec::new();
     let mut modified_ranges: Vec<(usize, usize)> = Vec::new();
     let mut modified_data = input_data.to_vec();
+    let mut modified_field_paths: Vec<String> = Vec::new();
 
     for instr in instructions {
+        if let Some(condition) = &instr.condition {
+            match evaluate_condition(condition, &parsed, &ctx) {
+                Ok(true) => {}
+                Ok(false) => {
+                    skipped.push(SkippedInstruction {
+                        field_path: instr.field_path.clone(),
+                        reason: format!("条件不满足，已跳过 ({})", condition),
+                    });
+                    continue;
+                }
+                Err(e) => {
+                    return Err(anyhow!("条件表达式求值失败: {}", e));
+                }
+            }
+        }
+
         let field = find_field_by_path(&parsed, &instr.field_path)
             .ok_or_else(|| {
                 let all_paths = collect_all_field_paths(&parsed);
@@ -787,6 +1339,7 @@ pub fn run_patch(
         modified_data[field.offset..field.offset + field.length].copy_from_slice(&new_bytes);
 
         modified_ranges.push((field.offset, field.offset + field.length));
+        modified_field_paths.push(instr.field_path.clone());
 
         changes.push(FieldChange {
             field_path: instr.field_path.clone(),
@@ -798,6 +1351,8 @@ pub fn run_patch(
             new_value_display: new_display,
         });
     }
+
+    let offset_warnings = check_offset_dependencies(&modified_field_paths, format_def);
 
     let checksum_recalcs = recalc_checksums(&parsed, format_def, &ctx, &modified_ranges, &mut modified_data, dry_run)?;
 
@@ -834,6 +1389,8 @@ pub fn run_patch(
         changes,
         checksum_recalcs,
         validation_failures: validation_failures.clone(),
+        skipped,
+        offset_warnings,
     };
 
     let exit_code = if !validation_failures.is_empty() {

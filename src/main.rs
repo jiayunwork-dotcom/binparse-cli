@@ -38,9 +38,11 @@ fn run(cli: Cli) -> Result<i32, Box<dyn std::error::Error>> {
             builtin_format,
             sets,
             patch_file,
+            vars,
             dry_run,
+            undo,
         }) => {
-            return run_patch_cmd(input, output, format.as_deref(), builtin_format.as_deref(), sets, patch_file.as_deref(), *dry_run);
+            return run_patch_cmd(input, output, format.as_deref(), builtin_format.as_deref(), sets, patch_file.as_deref(), vars, *dry_run, *undo);
         }
         _ => {}
     }
@@ -428,24 +430,10 @@ fn run_patch_cmd(
     builtin_format: Option<&str>,
     sets: &[String],
     patch_file: Option<&Path>,
+    vars: &[String],
     dry_run: bool,
+    undo: bool,
 ) -> Result<i32, Box<dyn std::error::Error>> {
-    if sets.is_empty() && patch_file.is_none() {
-        return Err("请至少指定一个--set参数或--patch-file参数".into());
-    }
-
-    let instructions = match patch::parse_patch_instructions(sets, patch_file) {
-        Ok(inst) => inst,
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            return Ok(patch::PatchError::FORMAT_ERROR);
-        }
-    };
-
-    if instructions.is_empty() {
-        return Err("没有有效的修改指令".into());
-    }
-
     let input_data = read_data(input)?;
 
     let format_def = match load_format_def(format_path, builtin_format, &input_data) {
@@ -456,6 +444,46 @@ fn run_patch_cmd(
         }
     };
 
+    if undo {
+        return match patch::undo_last_patch(output, &format_def) {
+            Ok((changes, exit_code)) => {
+                println!("=== 撤销成功 ===");
+                println!("\n已恢复以下字段 (共{}项):", changes.len());
+                for change in &changes {
+                    println!("\n  偏移: 0x{:08X} ({}字节)", change.offset, change.length);
+                    println!("  恢复前: {}", change.original_value_display);
+                    println!("  恢复后: {}", change.new_value_display);
+                }
+                println!("\n输出文件: {}", output.display());
+                Ok(exit_code)
+            }
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                Ok(patch::PatchError::FORMAT_ERROR)
+            }
+        };
+    }
+
+    if sets.is_empty() && patch_file.is_none() {
+        return Err("请至少指定一个--set参数或--patch-file参数".into());
+    }
+
+    let instructions = match patch::parse_patch_instructions(sets, patch_file, vars) {
+        Ok(inst) => inst,
+        Err(e) => {
+            let err_str = e.to_string();
+            eprintln!("Error: {}", e);
+            if err_str.contains("未定义的模板变量") {
+                return Ok(patch::PatchError::UNDEFINED_VARIABLE);
+            }
+            return Ok(patch::PatchError::FORMAT_ERROR);
+        }
+    };
+
+    if instructions.is_empty() {
+        return Err("没有有效的修改指令".into());
+    }
+
     let (result, exit_code) = match patch::run_patch(&input_data, output, &format_def, &instructions, dry_run) {
         Ok(r) => r,
         Err(e) => {
@@ -463,8 +491,11 @@ fn run_patch_cmd(
             if err_str.contains("字段路径不存在") {
                 eprintln!("Error: {}", e);
                 return Ok(patch::PatchError::FIELD_NOT_FOUND);
-            } else if err_str.contains("编码失败") || err_str.contains("值编码") || err_str.contains("超出范围") || err_str.contains("解析失败") {
+            } else if err_str.contains("编码失败") || err_str.contains("值编码") || err_str.contains("超出范围") || err_str.contains("解析失败") || err_str.contains("未定义的模板变量") {
                 eprintln!("Error: {}", e);
+                if err_str.contains("未定义的模板变量") {
+                    return Ok(patch::PatchError::UNDEFINED_VARIABLE);
+                }
                 return Ok(patch::PatchError::VALUE_ENCODING_ERROR);
             } else {
                 eprintln!("Error: {}", e);
@@ -491,6 +522,21 @@ fn run_patch_cmd(
         println!("  新字节:   {}", new_hex);
     }
 
+    if !result.skipped.is_empty() {
+        println!("\n跳过的修改 (共{}项):", result.skipped.len());
+        for skip in &result.skipped {
+            println!("  - {}: {}", skip.field_path, skip.reason);
+        }
+    }
+
+    if !result.offset_warnings.is_empty() {
+        eprintln!("\n=== 偏移量警告 ===");
+        for warning in &result.offset_warnings {
+            eprintln!("  注意: 字段{}的偏移表达式引用了被修改的字段{}，实际偏移可能需要手动调整",
+                warning.dependent_field, warning.modified_field);
+        }
+    }
+
     if !result.checksum_recalcs.is_empty() {
         println!("\n校验和重算 (共{}项):", result.checksum_recalcs.len());
         for cs in &result.checksum_recalcs {
@@ -505,12 +551,18 @@ fn run_patch_cmd(
     }
 
     if !dry_run {
+        if !result.changes.is_empty() {
+            if let Err(e) = patch::write_patch_history(output, &result.changes) {
+                eprintln!("\n警告: 无法写入patch历史文件: {}", e);
+            }
+        }
+
         if !result.validation_failures.is_empty() {
             eprintln!("\n=== 警告: 验证失败 ===");
             for (path, expected, actual) in &result.validation_failures {
                 eprintln!("  字段 {}: 期望值={}, 实际解析值={}", path, expected, actual);
             }
-        } else {
+        } else if !result.changes.is_empty() {
             println!("\n验证通过: 所有修改字段已正确写入并重新解析确认。");
         }
 
